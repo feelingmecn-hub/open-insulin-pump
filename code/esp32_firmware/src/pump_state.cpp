@@ -121,7 +121,7 @@ void pump_state_set_state(pump_state_t s)
 }
 
 // ---- 单位(U) ↔ 微步 统一换算 (全系统唯一入口) ----
-// 见 pump_state.h 头部推导: 0.5mm/rev · 1/32 微步 · 9.65mm 内腔(标准3ml笔芯)
+// 见 pump_state.h 头部推导: 0.5mm/rev · 1/32 微步 · 8.65mm 内腔(标准3ml注射器型)
 uint32_t units_to_microsteps(float units)
 {
     if (units <= 0.0f) return 0;

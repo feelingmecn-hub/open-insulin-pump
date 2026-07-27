@@ -137,17 +137,17 @@
 
 #define LEAD_SCREW_PITCH_MM   0.5f    // 丝杠导程 mm (默认保守估计, 需实测)
 
-#define SYRINGE_DIAMETER_MM   9.65f   // 储药器(标准3ml胰岛素笔芯)内腔直径 mm
+#define SYRINGE_DIAMETER_MM   8.65f   // 储药器(标准3ml注射器型储药器/丹纳PH300·优泵CY-13兼容)内腔直径 mm
 #define SYRINGE_RADIUS_MM     (SYRINGE_DIAMETER_MM / 2.0f)
 #define SYRINGE_AREA_MM2      (3.1415926f * SYRINGE_RADIUS_MM * SYRINGE_RADIUS_MM)
-                                        // ≈ 73.1 mm² (π·(9.65/2)²); 实测后微调 DOSE_CALIBRATION
+                                        // ≈ 58.8 mm² (π·(8.65/2)²); 实测后微调 DOSE_CALIBRATION
 
 #define MM_PER_STEP           (LEAD_SCREW_PITCH_MM / MOTOR_EFFECTIVE_STEPS)
 #define UL_PER_STEP           (MM_PER_STEP * SYRINGE_AREA_MM2)
 #define UNITS_PER_STEP        (UL_PER_STEP / 10.0f)
 #define STEPS_PER_UNIT        (1.0f / UNITS_PER_STEP)
 #define STEPS_PER_005U        ((uint16_t)(STEPS_PER_UNIT * 0.05f))
-                                        // = 88 微步 (0.05U; 理论 87.5055, 取整 88)
+                                        // = 109 微步 (0.05U; 理论 108.907, 取整 109)
 #define MIN_DOSE_UNITS        0.05f   // 最小给药精度 (U) — 全系统剂量网格
 
 // 剂量标定系数: 实际硬件导程/笔芯内径与标称存在制造偏差, 实测后修正。默认 1.0 (未标定)。
