@@ -1,0 +1,37 @@
+# ─────────────────────────────────────────────────────────────
+# 闭环胰岛素泵 DIY 项目 — .gitignore
+# ─────────────────────────────────────────────────────────────
+
+# WorkBuddy 本地记忆（含个人信息与项目笔记，切勿提交）
+.workbuddy/
+
+# 构建产物（模拟器 / 固件）
+build/
+build-*/
+**/build/
+pump_sim_build/
+cmake-build-*/
+
+# 操作系统垃圾
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 冗余截图：preview/ 已存 PNG，BMP 为模拟器临时产物
+simulator/lvgl_sdl/preview/*.bmp
+
+# 编辑器 / IDE
+*.swp
+*.swo
+.vscode/
+.idea/
+*.sublime-*
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.env
+
+# 日志
+*.log

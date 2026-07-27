@@ -1,0 +1,31 @@
+================================================================================
+  NOTICE — 安全与免责重点提示（请务必阅读）
+  NOTICE — SAFETY & DISCLAIMER HIGHLIGHTS (READ THIS FIRST)
+================================================================================
+
+本项目「开源闭环胰岛素泵 DIY 项目」是**理论验证 / 教学原型**，**不是医疗器械**。
+
+🚫 严禁用于任何人体（包括使用者本人）的胰岛素注射、输注或任何进入人体 /
+   接触人体的给药场景。
+
+🚫 本项目未通过任何监管机构（中国 NMPA、美国 FDA、欧盟 CE 等）认证。
+
+🚫 本项目精度未经计量标定、未经临床验证，缺乏失效安全冗余（无独立硬件互锁、
+   无机械止回给药切断）。
+
+⚠️ 把本项目的任何软件、固件、硬件设计用于人体，可能导致低血糖昏迷、酮症
+   酸中毒、严重伤害甚至死亡。
+
+✅ 本项目仅供：学习、研发、动物实验、教学演示。
+
+作者与所有贡献者明确否认一切因使用、修改、分发本项目而产生的医疗、法律、
+经济责任。下载、克隆、派生本仓库即表示你已理解并同意上述声明。
+
+许可证：
+  - 软件（代码）：MIT License             → 见 LICENSE
+  - 硬件（PCB/机械/原理图）：CERN-OHL-S  → 见 LICENSE-HARDWARE
+
+If you need a working closed-loop insulin therapy, use a regulator-approved
+commercial device and a legally compliant loop system (e.g. AndroidAPS/Loop
+with compliant hardware). This project is NOT such a device.
+================================================================================

@@ -1,0 +1,6 @@
+<resources>
+    <string name="app_name">OpenLoop Pump</string>
+    <string name="ble_device_name">OpenLoop-Pump</string>
+    <string name="channel_pump_connection">泵连接</string>
+    <string name="channel_loop">闭环循环</string>
+</resources>

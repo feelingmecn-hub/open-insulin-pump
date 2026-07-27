@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content>
+    <!-- 不备份包含配对密钥的 SharedPreferences / DataStore -->
+    <exclude domain="sharedpref" path="com.openloop.pump_preferences"/>
+    <exclude domain="database" path="openloop_pump.db"/>
+</full-backup-content>

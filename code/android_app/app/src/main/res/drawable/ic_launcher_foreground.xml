@@ -1,0 +1,15 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 简化的"泵/水滴"图标前景 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,30 C54,30 38,52 38,64 a16,16 0 1,0 32,0 C70,52 54,30 54,30 Z" />
+    <circle
+        android:fillColor="#0E6BA8"
+        android:cx="54"
+        android:cy="64"
+        android:r="6" />
+</vector>
