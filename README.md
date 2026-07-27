@@ -155,6 +155,26 @@
 
 > 详细 BOM、原理图、机械设计见 [`docs/11-bom.md`](docs/11-bom.md)、[`docs/04-pcb-schematic.md`](docs/04-pcb-schematic.md)、[`docs/08-mechanical-design.md`](docs/08-mechanical-design.md)。**所有硬件数据均为理论设计，未经实物验证。**
 
+### 5.1 硬件接线（快速参考）
+
+> 🚫 理论验证用途，**严禁用于人体**；仅在断开电池、无药液、纯电路环境下接线。
+
+**核心原则**：ESP32-C6 开发板（含屏）是主板，其余外设挂在它的 GPIO 上；所有模块必须共地；11.1V 只接电机/INA226/DC-DC，**绝不接 GPIO**。
+
+| 外设 | 接 ESP32 的 GPIO | 关键说明 |
+|------|------------------|----------|
+| DRV8825 步进驱动 | STEP=**9** / DIR=**10** / ENABLE=**11**(低有效) / nFAULT→**16** | VMOT 接 11.1V，VDD 接 3.3V；M0/M1/M2 焊死 H/H/L=1/32 微步，nSLEEP/nRESET 硬件拉高 |
+| SM2012 电机 | DRV8825 的 AOUT1/AOUT2、BOUT1/BOUT2 | 4 根线分 A/B 两相，接错只抖动不转，对调一组即可 |
+| INA226 监测 | SDA=**18** / SCL=**19**（**必须显式指定，不可用默认 21/22**） | VCC 接 **3.3V**（勿接 5V，否则烧毁 C6）；VBUS 接 11.1V 母线；IN± 跨 20mΩ 分流电阻；A0/A1 接地=0x40 |
+| 4 键按键板 | 上=**20** / 下=**23** / SET=**4** / ESC=**5** | 每键一端接 GPIO、一端接 GND（内上拉，低有效） |
+| 限位开关 ×2 | 前进=**2** / 后退=**3** | 一端 GPIO、一端 GND |
+| 蜂鸣器 | 信号=**0**（PWM） | 另一端 GND |
+| WS2812 状态灯 | 板载 GPIO8 | 开发板已集成，不接 |
+| DC-DC 使能(可选) | **17** | 模块无 EN 则悬空 |
+
+- LCD 屏、USB、WS2812 均为**开发板板载**，无需接线；GPIO6/7/14/15/21/22 已被 LCD 占用，禁止复用。
+- 完整接线表、电源树图、相位判定、检查清单见 👉 [**`docs/12-wiring.md`**](docs/12-wiring.md)。
+
 ---
 
 ## 6. 快速开始
@@ -166,7 +186,8 @@
 4. [`docs/05-firmware-design.md`](docs/05-firmware-design.md) 软件架构（含 ui_hal / 调度器 / BLE 协议）
 5. [`docs/06-aaps-integration.md`](docs/06-aaps-integration.md) AAPS 对接
 6. [`docs/09-safety-design.md`](docs/09-safety-design.md) 安全设计（**必读**）
-7. [`docs/11-bom.md`](docs/11-bom.md) 物料清单
+7. [`docs/12-wiring.md`](docs/12-wiring.md) 硬件接线（**动手前必看**）
+8. [`docs/11-bom.md`](docs/11-bom.md) 物料清单
 
 ### 6.2 PC 模拟器（无需硬件，最快验证 UI）
 ```bash
