@@ -148,6 +148,7 @@
 #define STEPS_PER_UNIT        (1.0f / UNITS_PER_STEP)
 #define STEPS_PER_005U        ((uint16_t)(STEPS_PER_UNIT * 0.05f))
                                         // ≈ 403 微步 (0.05U)
+#define MIN_DOSE_UNITS        0.05f   // 最小给药精度 (U) — 全系统剂量网格
 
 #define MOTOR_MAX_SPEED_HZ    5000
 #define MOTOR_MIN_SPEED_HZ    500

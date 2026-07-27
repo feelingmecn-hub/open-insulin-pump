@@ -102,18 +102,18 @@ static void execute_command(const motor_command_t *cmd)
 
     switch (cmd->type) {
         case MOTOR_CMD_BOLUS: {
+            // 唯一换算入口: 单位(U) → 微步 (四舍五入)
             float units = cmd->units_x100 / 100.0f;
-            steps = (uint32_t)(units * STEPS_PER_UNIT);
+            steps = units_to_microsteps(units);
             motor_move_sync(MOTOR_DIR_FORWARD, steps, speed);
-            g_pump_state.reservoir_units_left =
-                (uint16_t)(g_pump_state.reservoir_units_left > (units + 0.005f)
-                           ? g_pump_state.reservoir_units_left - (uint16_t)(units * 100) / 100.0f
-                           : 0);
+            // 储药器扣减由 ui_hal_deliver_bolus → pump_state_consume_units() 统一处理,
+            // 此处不再扣减, 避免重复计数。
             break;
         }
         case MOTOR_CMD_BASAL_TICK:
-            // 基础率每 BASAL_TICK_INTERVAL_MS 推注的小步
-            motor_move_sync(MOTOR_DIR_FORWARD, steps, speed);
+            // 基础率每 BASAL_TICK_INTERVAL_MS 推注的小步: 同样经唯一换算入口,
+            // 不能再用 cmd->steps (调度器只填 units_x100, steps 恒为 0 → 原 bug 不动电机)
+            motor_move_sync(MOTOR_DIR_FORWARD, units_to_microsteps(cmd->units_x100 / 100.0f), speed);
             break;
         case MOTOR_CMD_PRIME:
             motor_move_sync(MOTOR_DIR_FORWARD, steps ? steps : 2000, speed);

@@ -120,6 +120,29 @@ void pump_state_set_state(pump_state_t s)
     g_pump_state.current_state = (uint8_t)s;
 }
 
+// ---- 单位(U) ↔ 微步 统一换算 (全系统唯一入口) ----
+// 见 pump_state.h 头部推导: 0.5mm/rev · 1/32 微步 · 4.5mm 内径
+uint32_t units_to_microsteps(float units)
+{
+    if (units <= 0.0f) return 0;
+    float steps = units * STEPS_PER_UNIT;   // STEPS_PER_UNIT ∈ config.h
+    return (uint32_t)(steps + 0.5f);        // 四舍五入, 误差 < 1 微步 ≈ 0.00012U
+}
+
+float microsteps_to_units(uint32_t steps)
+{
+    return (float)steps / STEPS_PER_UNIT;
+}
+
+// 吸附到 0.05U 最小精度网格: 0.05 的整数倍, 且不低于 MIN_DOSE_UNITS
+float quantize_units_005(float units)
+{
+    if (units <= 0.0f) return 0.0f;
+    float q = (float)((int)(units / MIN_DOSE_UNITS + 0.5f)) * MIN_DOSE_UNITS;
+    if (q < MIN_DOSE_UNITS) q = MIN_DOSE_UNITS;
+    return q;
+}
+
 // CRC-8 (CCITT): poly 0x07, init 0x00
 uint8_t crc8_ccitt(const uint8_t *data, size_t len)
 {

@@ -22,3 +22,12 @@ void pump_state_set_state(pump_state_t s);
 
 // CRC-8 (CCITT) 实现
 uint8_t crc8_ccitt(const uint8_t *data, size_t len);
+
+// ============================================================
+// 单位(U) ↔ 微步 统一换算 (与固件端保持一致, 0.5mm/rev · 1/32 微步 · 4.5mm 内径)
+//   大剂量 / 基础率 / 排气 等所有「打药」路径都必须经这两个函数,
+//   0.05U(U-100) = STEPS_PER_005U ≈402 微步。
+// ============================================================
+uint32_t units_to_microsteps(float units);   // 四舍五入到最近整数微步
+float   microsteps_to_units(uint32_t steps); // 反算
+float   quantize_units_005(float units);     // 吸附到 0.05U 最小精度网格

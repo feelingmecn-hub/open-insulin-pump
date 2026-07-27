@@ -51,6 +51,23 @@
 - ⚠️ 特别标注：INA226 的 VCC **必须 3.3V**（ESP32-C6 不耐 5V），纠正了电源树注释里
   INA226 挂在 5V 分支的隐患，避免 I²C 上拉到 5V 烧毁 MCU。
 
+### 电机控制精度统一（0.5mm/转 · 1/32 微步 · 0.05U 最小精度）
+- **统一换算入口**：新增 `units_to_microsteps()` / `microsteps_to_units()` / `quantize_units_005()`
+  （`pump_state.c/.h`，模拟器与固件两份同步）。推导：1 转=0.5mm 导程、1 转=200 步×1/32=6400 微步、
+  储药器内径 4.5mm → STEPS_PER_UNIT≈8048 微步/U，**0.05U = STEPS_PER_005U ≈ 402 微步**，
+  每微步≈0.000124U（远细于 0.05U）。全系统（大剂量/基础率/排气）禁止各模块自行用
+  `STEPS_PER_UNIT` 现算，必须经此函数，取整误差 < 0.00006U。
+- **修复基础率不动电机的 BUG**：原 `MOTOR_CMD_BASAL_TICK` 直接用 `cmd->steps`（调度器只填
+  `units_x100`，steps 恒为 0）→ 基础率每 3 分钟推注 0 微步、实际从不打药。改为用
+  `units_to_microsteps(units_x100/100)` 换算，基础率恢复真实输注（0.5U/h → 每 tick≈201 微步）。
+- **修复大剂量储药器重复扣减**：原 `motor_controller` 大剂量分支自行扣 `reservoir_units_left`
+  （且算法有损），而 HAL 已通过 `pump_state_consume_units()` 扣减 → 双重扣减且精度错。现电机只负责
+  运动，储药器扣减统一交给 `consume_units()`（含亚单位累加器，避免 0.05U 小数丢失）。
+- **0.05U 最小精度落地**：固件 HAL `ui_hal_deliver_bolus` 在入队前对立即量/延展量调用
+  `quantize_units_005()` 吸附到 0.05U 网格（UI/BLE/向导/三餐所有大剂量入口统一生效）。
+- **数值验证**（host 编译 `config.h` 实测）：6400 微步/转、0.05U=402 微步、100U 满笔芯≈804813 微步
+  < uint32 上限；剂量回算误差均 < 6e-5 U。模拟器 ninja 编译通过（共享 pump_state.cpp 验证）。
+
 ---
 
 ## 2026-07-25 — 项目初始化与文档

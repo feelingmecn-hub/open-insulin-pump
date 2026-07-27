@@ -105,6 +105,10 @@ void ui_hal_deliver_bolus(float total_units, bolus_kind_t kind,
     if (total_units < 0.01f) return;
     if (total_units > g_pump_config.max_bolus_single) total_units = g_pump_config.max_bolus_single;
 
+    // 吸附到 0.05U 最小精度网格 (全系统统一剂量精度, 见 quantize_units_005)
+    immediate_units = quantize_units_005(immediate_units);
+    extended_units  = quantize_units_005(extended_units);
+
     // 立即量 → 入队电机命令
     if (immediate_units > 0.001f) {
         motor_command_t cmd{0};
