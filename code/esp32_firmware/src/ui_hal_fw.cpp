@@ -17,6 +17,7 @@
 #include "config.h"
 
 #include "motor_controller.h"
+#include "basal_scheduler.h"
 #include "lcd_display.h"
 #include "history_log.h"
 #include "storage.h"
@@ -99,7 +100,7 @@ bool ui_hal_basal_local_mode(void)
 void ui_hal_deliver_bolus(float total_units, bolus_kind_t kind,
                           float duration_h, float immediate_units, float extended_units)
 {
-    (void)total_units; (void)duration_h;
+    (void)total_units;
 
     // 安全限制
     if (immediate_units < 0.01f && extended_units < 0.01f) return;
@@ -122,15 +123,10 @@ void ui_hal_deliver_bolus(float total_units, bolus_kind_t kind,
         motor_enqueue(&cmd);
     }
 
-    // 方波/双波延展量 → 作为第二条 bolus 入队 (总量正确, 时序铺开见下方 TODO)
-    // TODO: 完整的方波调度应在 basal_scheduler 中按 duration_h 时间维铺开,
-    //       而非作为一次性大剂量; 当前仅保证总量与分批安全。
+    // 方波/双波延展量 → 交给 basal_scheduler 按 duration_h 时间维铺开
+    // (不再作为一次性大剂量入队; 总量正确 + 时序正确 + 可中途取消)
     if (extended_units > 0.001f) {
-        motor_command_t cmd{0};
-        cmd.type       = MOTOR_CMD_BOLUS;
-        cmd.units_x100 = (uint32_t)(extended_units * 100.0f + 0.5f);
-        cmd.kind       = k;
-        motor_enqueue(&cmd);
+        basal_scheduler_start_extended_bolus(extended_units, duration_h, k);
     }
 }
 
@@ -178,10 +174,11 @@ void ui_hal_init(void)
 
 bool ui_hal_bolus_active(void)
 {
-    return motor_bolus_active();
+    return motor_bolus_active() || basal_scheduler_extended_bolus_active();
 }
 
 void ui_hal_cancel_bolus(void)
 {
     motor_cancel_bolus();
+    basal_scheduler_cancel_extended_bolus();
 }

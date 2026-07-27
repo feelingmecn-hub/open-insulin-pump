@@ -15,3 +15,9 @@
 
 void basal_scheduler_init(void);
 void basal_scheduler_task(void *arg);
+
+// 方波/双波延展量: 按 duration_h 时间维在 basal_scheduler tick 中铺开
+// (取代原先"延展量作一次性第二条大剂量入队"的做法, 实现真正的时间维铺开)
+void basal_scheduler_start_extended_bolus(float units, float duration_h, uint8_t kind);
+void basal_scheduler_cancel_extended_bolus(void);
+bool basal_scheduler_extended_bolus_active(void);

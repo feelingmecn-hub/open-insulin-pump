@@ -199,6 +199,11 @@ static void execute_command(const motor_command_t *cmd)
             // 不能再用 cmd->steps (调度器只填 units_x100, steps 恒为 0 → 原 bug 不动电机)
             motor_move_sync(MOTOR_DIR_FORWARD, units_to_microsteps(cmd->units_x100 / 100.0f), speed);
             break;
+        case MOTOR_CMD_BOLUS_EXT:
+            // 方波/双波延展量的一次性微投递: 同样经唯一换算入口走丝杠。
+            // 记账(储药器/今日/IOB)由 basal_scheduler 在入队时同步完成, 此处仅物理推注。
+            motor_move_sync(MOTOR_DIR_FORWARD, units_to_microsteps(cmd->units_x100 / 100.0f), speed);
+            break;
         case MOTOR_CMD_PRIME:
             motor_move_sync(MOTOR_DIR_FORWARD, steps ? steps : 2000, speed);
             g_pump_state.is_primed = true;

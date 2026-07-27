@@ -58,6 +58,7 @@ typedef enum {
     MOTOR_CMD_NONE = 0,
     MOTOR_CMD_BOLUS,
     MOTOR_CMD_BASAL_TICK,
+    MOTOR_CMD_BOLUS_EXT,   // 方波/双波延展量的一次性微投递(由 basal_scheduler 按 duration 时间维铺开)
     MOTOR_CMD_PRIME,
     MOTOR_CMD_STOP,
     MOTOR_CMD_REWIND,
@@ -191,6 +192,7 @@ typedef struct {
     // --- 闭环 / 临时基础率 / 今日统计 ---
     uint8_t      loop_mode;               // 0 闭环(AAPS接管) / 1 开环(本地档案) / 2 暂停
     uint32_t     today_units_x100;        // 今日累计注射 (U × 100)
+    uint32_t     total_units_x100_delivered; // 累计注射单位 × 100 (全生涯 live 计数, 由 motor/basal 实时累加)
     float        tbr_percent;             // 临时基础率百分比 (0 = 无)
     float        tbr_rate;                // 临时基础率 U/h (绝对)
     uint32_t     tbr_expiry_ms;           // 临时基础率到期时间 (millis())
@@ -199,6 +201,13 @@ typedef struct {
     uint16_t     motor_current_ma;        // 电机电流 mA (运动期间)
     uint16_t     bus_power_mw;            // 母线功率 mW
     bool         step_loss_detected;      // 丢步/异常标志
+    // --- 方波/双波延展量(按时间铺开, 由 basal_scheduler 驱动) ---
+    bool     ext_bolus_active;          // 延展量铺开中
+    uint8_t  ext_bolus_kind;            // 大剂量类型 (bolus_kind_t)
+    uint32_t ext_bolus_total_x100;      // 延展总量 × 100
+    uint32_t ext_bolus_delivered_x100;  // 已铺开量 × 100
+    uint32_t ext_bolus_duration_ms;     // 总时长 ms
+    uint32_t ext_bolus_start_ms;        // 起始 millis()
 } pump_runtime_state_t;
 
 // ============================================================

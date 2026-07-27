@@ -4,6 +4,25 @@
 
 ---
 
+## 2026-07-27（方波/双波）— 大剂量按时间维铺开 + 修复累计字段缺失
+
+- **方波/双波「时长铺开」已实现**：延展量不再作为第二条一次性大剂量入队，
+  改由 `basal_scheduler` 按 `duration_h` 时间维在每 3 分钟 tick 中按比例铺开
+  （`extended_bolus_tick()`）；每个 tick 微投递封装为新增的 `MOTOR_CMD_BOLUS_EXT`，
+  仍走 `execute_command()` 唯一电机入口、换算走 `dosing.h`、记账（储药器/今日/累计/IOB）
+  在入队时同步完成。时间到收尾写一条 `EVENT_TYPE_BOLUS`、双波 = 立即 + 延展两条事件。
+- **取消/安全**：`ui_hal_cancel_bolus()` 同时取消立即量与延展量；`ui_hal_bolus_active()`
+  在任一进行中均返回真；延展量投递前复检储药器空，空则中止并记部分事件；`duration_h ≤ 0` 退化为一次性大剂量。
+- **修复预存固件编译缺陷**：`g_pump_state.total_units_x100_delivered` 此前仅在
+  `pump_config_t` 声明，但 `motor_controller.cpp` / `basal_scheduler.cpp` 以
+  `g_pump_state.total_units_x100_delivered` 累加（模拟器不编译这两文件，缺陷一直潜伏）。
+  已在 `pump_runtime_state_t` 补该 live 累计字段，固件现在可正确编译。
+- **验证**：宿主 C++ 测试（stub 掉 FreeRTOS/ESP 依赖，编译真实 `basal_scheduler.cpp`）
+  覆盖 5 个用例全部通过——3U/60min 等比铺开(20×0.15U)、0.1U 小量末段投递、
+  中途取消只损失已铺开部分、储药器空中止不过量、`duration ≤ 0` 退化。模拟器 ninja 构建无回归。
+
+---
+
 ## 2026-07-27（架构重构）— 储药罐类型配置化 + 剂量换算单一真源 (dosing.h)
 
 > 用户要求：储药罐类型应在配置里选、所有打药控制从一个参数出、所有算法从一个地方输出，

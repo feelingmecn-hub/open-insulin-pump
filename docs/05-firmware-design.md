@@ -513,8 +513,25 @@ float    quantize_units_005(float units);    // 吸附到 0.05U 网格
   取消正在打入的大剂量（首页底部显示「大剂量注射中… (按 ESC 取消)」）；BLE 控制通道亦可触发。
 - 基础率（0.5U/h → 每 3 分钟仅 ~0.025U ≈ 201 微步）本身已极慢，等价于「自然分段」，无需改动。
 
-> 注意：方波/双波的「时长铺开」（把延展量按 `duration_h` 在时间维分散）尚未实现，
-> 当前延展量作为第二条一次性大剂量入队，仅保证总量与分批安全。完整时序铺开待 `basal_scheduler` 扩展。
+### 6.2.3 方波 / 双波大剂量：按时间维铺开（Extended Bolus Time-Spread）
+
+- **入口**：`ui_hal_deliver_bolus()`（固件后端 `ui_hal_fw.cpp`）把「立即量」作为一次性
+  `MOTOR_CMD_BOLUS` 入队；把「延展量」交给 `basal_scheduler_start_extended_bolus()`，
+  **不再作为第二条一次性大剂量入队**。
+- **驱动**：`basal_scheduler_task()` 每 `BASAL_TICK_INTERVAL_MS`（3 分钟）调用
+  `extended_bolus_tick()`，按「已过时间比例」计算本 tick 应铺开的量
+  `target = total × (elapsed / duration_ms)`，与已铺开量之差即本 tick 投递量。
+- **电机路径**：每个 tick 的微投递封装为 `MOTOR_CMD_BOLUS_EXT`，仍经 `execute_command()`
+  这一全系统唯一电机入口，换算统一走 `dosing.h`；记账（储药器/今日/累计/IOB）在入队时同步完成，
+  与 `motor_deliver_bolus()` 的分段记账一致——中途取消或储药器空只损失未铺开部分。
+- **收尾**：时间到（`frac ≥ 1`）投递剩余零头，并写**一条** `EVENT_TYPE_BOLUS` 历史事件
+  （与「立即量」分开记，双波 = 立即 + 延展两条事件），`total_bolus_count++` 持久化。
+- **取消 / 安全**：`ui_hal_cancel_bolus()` 同时取消立即量（`motor_cancel_bolus()`）与延展量
+  （`basal_scheduler_cancel_extended_bolus()`）；`ui_hal_bolus_active()` 在任一进行中均返回真。
+  延展量投递前复检 `reservoir_units_left < 1`，空则中止并记为部分事件。
+- **退化**：`duration_h ≤ 0` 时退化为一次性大剂量（与原行为一致），不进 EXT 路径。
+- 状态暴露于 `g_pump_state.ext_bolus_*`（活动标志 / 类型 / 总量 / 已铺开 / 时长 / 起始），
+  UI 与 BLE 可据此显示「方波注射中」进度。
 
 ---
 
