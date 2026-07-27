@@ -137,23 +137,39 @@
 
 #define LEAD_SCREW_PITCH_MM   0.5f    // 丝杠导程 mm (默认保守估计, 需实测)
 
-#define SYRINGE_DIAMETER_MM   8.65f   // 储药器(标准3ml注射器型储药器/丹纳PH300·优泵CY-13兼容)内腔直径 mm
-#define SYRINGE_RADIUS_MM     (SYRINGE_DIAMETER_MM / 2.0f)
-#define SYRINGE_AREA_MM2      (3.1415926f * SYRINGE_RADIUS_MM * SYRINGE_RADIUS_MM)
-                                        // ≈ 58.8 mm² (π·(8.65/2)²); 实测后微调 DOSE_CALIBRATION
+// ============================================================
+// 8.1 储药罐类型 (★唯一选择点★: 改这一处即可切换耗材, 几何/换算全自动重算)
+//     换算系数绝不在别处手算硬编码 — 全部由 dosing.h 从「内腔直径」单一推导。
+// ============================================================
+#define RESERVOIR_TYPE_CY13_DANA     1   // 瑞宇优泵 PH300 / 丹纳兼容 3mL 注射器型储药器, 内腔 Φ8.65mm
+#define RESERVOIR_TYPE_CARTRIDGE_3ML 2   // 3mL 卡式瓶(笔芯), 内腔 Φ9.65mm
+#define RESERVOIR_TYPE               RESERVOIR_TYPE_CY13_DANA   // ← 当前采用
 
-#define MM_PER_STEP           (LEAD_SCREW_PITCH_MM / MOTOR_EFFECTIVE_STEPS)
-#define UL_PER_STEP           (MM_PER_STEP * SYRINGE_AREA_MM2)
-#define UNITS_PER_STEP        (UL_PER_STEP / 10.0f)
-#define STEPS_PER_UNIT        (1.0f / UNITS_PER_STEP)
-#define STEPS_PER_005U        ((uint16_t)(STEPS_PER_UNIT * 0.05f))
-                                        // = 109 微步 (0.05U; 理论 108.907, 取整 109)
+#if   RESERVOIR_TYPE == RESERVOIR_TYPE_CY13_DANA
+  #define SYRINGE_DIAMETER_MM   8.65f
+  #define RESERVOIR_CAPACITY_U  300
+  #define RESERVOIR_TYPE_NAME   "CY13/Dana 3mL 注射器型"
+#elif RESERVOIR_TYPE == RESERVOIR_TYPE_CARTRIDGE_3ML
+  #define SYRINGE_DIAMETER_MM   9.65f
+  #define RESERVOIR_CAPACITY_U  300
+  #define RESERVOIR_TYPE_NAME   "3mL 卡式瓶(笔芯)"
+#else
+  #error "RESERVOIR_TYPE 未选择有效储药罐类型 (见 config.h §8.1)"
+#endif
+
+// ---- 剂量网格 / 标定 (全系统) ----
 #define MIN_DOSE_UNITS        0.05f   // 最小给药精度 (U) — 全系统剂量网格
-
-// 剂量标定系数: 实际硬件导程/笔芯内径与标称存在制造偏差, 实测后修正。
-// 例: 实测打出 0.05U 实际为 0.051U → 标定 = 0.051/0.05 = 1.02。默认 1.0 (未标定)。
-// 该系数作用于唯一换算入口 units_to_microsteps(), 全系统剂量随之整体缩放。
+// 剂量标定系数: 实际硬件导程/笔芯内径与标称存在制造偏差, 实测后修正。默认 1.0 (未标定)。
+// 该系数作用于唯一换算入口 units_to_microsteps() (见 dosing.h), 全系统剂量随之整体缩放。
 #define DOSE_CALIBRATION      1.0f
+
+// ============================================================
+// 9. 剂量换算单一真源 (dosing.h)
+//     所有「单位(U)↔微步」换算与几何推导都集中在 dosing.h, 由本文件末尾 #include 引入。
+//     任何模块禁止自行用 STEPS_PER_UNIT 现算, 统一调用 units_to_microsteps() 等三函数。
+// ============================================================
+
+
 
 // ---- 大剂量分批打入 (segmented bolus) ----
 // 真实胰岛素泵以「步进 + 段间停顿」方式给大剂量 (Wellion: 0.05U/步, 1s 间隔, ≈3U/min;
@@ -161,8 +177,7 @@
 // 每批推 0.05U (最小精度网格), 段间停顿并复检安全 (阻塞/报警/储药器空), 支持中途取消。
 #define BOLUS_SEGMENT_UNITS       MIN_DOSE_UNITS   // 每批 0.05U
 #define BOLUS_SEGMENT_INTERVAL_MS 1000             // 段间停顿 1s → 约 3U/min
-#define BOLUS_SPEED_HZ            500              // 单批脉冲频率 (109 微步 ≈ 0.22s; 段间 1s 停顿主导速率≈3U/min)
-
+#define BOLUS_SPEED_HZ            500
 #define MOTOR_MAX_SPEED_HZ    5000
 #define MOTOR_MIN_SPEED_HZ    500
 #define MOTOR_ACCEL_HZ        2000
@@ -207,7 +222,7 @@
 #define MAX_BOLUS_UNITS        25.0f
 #define MAX_BASAL_RATE         5.0f
 #define BASAL_TICK_INTERVAL_MS 180000
-#define MAX_RESERVOIR_UNITS    300
+#define MAX_RESERVOIR_UNITS    RESERVOIR_CAPACITY_U
 #define IOB_DURATION_HOURS     4.0f
 
 // ============================================================
@@ -281,5 +296,7 @@
 #define BLE_CHAR_CONTROL_UUID       { 0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, \
                                       0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, \
                                       0x09, 0x00, 0x40, 0x6E }
+
+#include "dosing.h"
 
 #endif // CONFIG_H

@@ -360,7 +360,7 @@ void motor_task(void* param) {
         if (now - last_basal_time >= pdMS_TO_TICKS(180000)) {
             // 根据当前时间和基础率方案计算下一步推注量
             float rate = get_current_basal_rate();
-            uint32_t steps = rate * STEPS_PER_UNIT / 20;  // 0.05U
+            uint32_t steps = units_to_microsteps(rate / 20.0f);  // 0.05U, 经唯一换算入口
             motor_command_t basal_cmd = {CMD_BASAL_TICK, steps, 0, 0};
             // 直接执行（不通过队列）
             deliver_motor_steps(steps, MOTOR_FORWARD);
@@ -459,13 +459,18 @@ void safety_task(void* param) {
 > 结论：**打 0.05U = 109 微步**，实际剂量 0.05006U（误差 +0.12%，远低于医疗泵 ±15% 要求）。
 > 机械分辨率 0.000459U 比 0.05U 精细约 109 倍，因此「控制精度」绰绰有余；真正决定
 > 「绝对精度」的是丝杠导程与笔芯内径的**实测值**——见 6.1.3 标定系数。
+>
+> （下表为当前 `RESERVOIR_TYPE = RESERVOIR_TYPE_CY13_DANA` 的取值；切换储药罐类型后
+> 由 `dosing.h` 自动重算，无需手工改动任何数字。）
 
-### 6.1.2 唯一换算入口（防精度漂移）
+### 6.1.2 单一真源：储药罐类型 + 换算模块（防精度漂移）
 
-全系统（大剂量 / 基础率 / 排气）禁止各模块各自拿 `STEPS_PER_UNIT` 现算，必须统一走：
+- **储药罐类型在 `config.h` 用 `RESERVOIR_TYPE` 唯一选择**（如 `RESERVOIR_TYPE_CY13_DANA` / `RESERVOIR_TYPE_CARTRIDGE_3ML`）。切换耗材只改这一个宏，几何与换算全自动重算，绝不允许多处硬编码。
+- **全部「单位(U)↔微步」换算算法与几何推导集中在 `dosing.h`（单一真源）**：它仅从「内腔直径」推导截面积 / 每转体积 / `STEPS_PER_UNIT` / `STEPS_PER_005U`，并定义以下三函数。固件与模拟器**共用同一份** `dosing.h`，杜绝算法双份。
+- 全系统（大剂量 / 基础率 / 排气）禁止任何模块各自拿 `STEPS_PER_UNIT` 现算，必须统一走：
 
 ```c
-// pump_state.c — 单位(U) ↔ 微步 唯一换算
+// dosing.h — 单位(U) ↔ 微步 唯一换算 (static inline, 单一真源)
 uint32_t units_to_microsteps(float units);   // 四舍五入, 误差 < 1 微步
 float    microsteps_to_units(uint32_t steps);
 float    quantize_units_005(float units);    // 吸附到 0.05U 网格

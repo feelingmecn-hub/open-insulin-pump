@@ -81,26 +81,8 @@ void pump_state_set_state(pump_state_t s)
     g_pump_state.current_state = (uint8_t)s;
 }
 
-// ---- 单位(U) ↔ 微步 统一换算 (与固件端保持一致) ----
-uint32_t units_to_microsteps(float units)
-{
-    if (units <= 0.0f) return 0;
-    float steps = units * STEPS_PER_UNIT * DOSE_CALIBRATION;
-    return (uint32_t)(steps + 0.5f);
-}
-
-float microsteps_to_units(uint32_t steps)
-{
-    return (float)steps / (STEPS_PER_UNIT * DOSE_CALIBRATION);
-}
-
-float quantize_units_005(float units)
-{
-    if (units <= 0.0f) return 0.0f;
-    float q = (float)((int)(units / MIN_DOSE_UNITS + 0.5f)) * MIN_DOSE_UNITS;
-    if (q < MIN_DOSE_UNITS) q = MIN_DOSE_UNITS;
-    return q;
-}
+// ---- 单位(U) ↔ 微步 统一换算 ----
+// 定义已移至 dosing.h (static inline, 单一真源), 本文件不再重复定义。
 
 // CRC-8 (CCITT): poly 0x07, init 0x00
 uint8_t crc8_ccitt(const uint8_t *data, size_t len)

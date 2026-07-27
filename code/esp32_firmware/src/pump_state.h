@@ -4,6 +4,7 @@
 #pragma once
 
 #include "pump_types.h"
+#include "config.h"   // 引入 dosing.h: 换算 API 与全部几何常量 (单一真源) 对任何包含本头的 TU 可见
 
 // 实时状态 (所有任务读写, display 仅读)
 extern pump_runtime_state_t g_pump_state;
@@ -25,16 +26,11 @@ void pump_state_consume_units(float units);
 
 // ============================================================
 // 单位(U) ↔ 微步 统一换算  ← 全系统唯一换算入口
-//   推导: 1 转 = 0.5mm(导程), 1 转 = 200 步 × 1/32 微步 = 6400 微步
-//         储药器(标准3ml注射器型)内腔直径 8.65mm → 截面积 ≈58.8mm², 每微步推进 0.5/6400 mm
-//         → 每微步体积 ≈4.59e-3 µL → 0.05U(U-100) = STEPS_PER_005U ≈109 微步
-//   大剂量 / 基础率 / 排气 等所有「打药」路径都必须经这两个函数,
-//   严禁各模块自行用 STEPS_PER_UNIT 现算, 避免精度/取整不一致。
+//   换算算法与全部几何推导集中在 dosing.h (单一真源), 由 config.h 自动引入,
+//   不再于本文件重复声明/定义。大剂量 / 基础率 / 排气 等所有「打药」路径都必须
+//   且只能经 units_to_microsteps() / microsteps_to_units() / quantize_units_005()
+//   三函数, 严禁各模块自行用 STEPS_PER_UNIT 现算, 避免精度/取整不一致。
 // ============================================================
-uint32_t units_to_microsteps(float units);   // 四舍五入到最近整数微步
-float   microsteps_to_units(uint32_t steps); // 反算
-// 将剂量吸附到 0.05U 最小精度网格 (大剂量命令级安全网)
-float   quantize_units_005(float units);
 
 // 给一份合理的内置默认基础率方案 (profile 0 = 0.5 U/h 全天)
 void pump_config_apply_default_basal(pump_config_t *cfg);

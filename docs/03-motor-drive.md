@@ -46,7 +46,7 @@
 > 明确为「3 ml polypropylene syringe」，标准鲁尔接口），内腔直径 ≈ **8.65mm**
 > （国标 3ml 鲁尔预灌封注射器 I.D.=Φ8.65±0.09mm，ClearJect 3mL 塑料预灌封注射器一致）。
 > 注意：商品页上的「4.5mm / 6.5mm」是**输注钢针/软针的针长**，不是储药器内径！
-> 换算系数以该 8.65mm 为准（见 docs/05 §6.1）。
+> 换算系数以该 8.65mm 为准（见 docs/05 §6.1；储药罐类型在 config.h 的 `RESERVOIR_TYPE` 选择，单一真源）。
 
 ### 2.3 精度计算公式
 
@@ -248,23 +248,18 @@ DRV8825 支持三种电流衰减模式（DECAY 引脚）：
 ### 4.2 单步 0.05U 注射的实现
 
 ```cpp
-// 基础常量
-const uint16_t STEPS_PER_REV = 200;
-const uint16_t MICROSTEP = 32;
-const float LEAD_SCREW_PITCH_MM = 0.5;
-const float SYRINGE_AREA_MM2 = 28.3;  // 1mL 注射器
-const float U100_VOLUME_PER_UNIT_MM3 = 10.0;  // 1U = 10µL = 10 mm³
-
-// 计算
+// ⚠️ 以下仅为「原理示意」, 真实工程不做手算硬编码 —— 全部集中在 dosing.h 单一真源:
+//   config.h 用 RESERVOIR_TYPE 选择储药罐类型 (CY13_DANA / CARTRIDGE_3ML ...),
+//   dosing.h 仅从「内腔直径」推导面积/每转体积/STEPS_PER_UNIT/STEPS_PER_005U,
+//   并定义 units_to_microsteps()/microsteps_to_units()/quantize_units_005() 三函数。
+//   切换耗材 = 改一个宏, 几何与换算全自动重算, 所有调用点零改动。
+//
+// 示意 (以「1mL 注射器 28.3mm²」为例, 非本项目实际值):
+const float SYRINGE_AREA_MM2 = 28.3;
 const float MM_PER_STEP = LEAD_SCREW_PITCH_MM / (STEPS_PER_REV * MICROSTEP);
-const float VOLUME_PER_STEP_MM3 = MM_PER_STEP * SYRINGE_AREA_MM2;
-
-// 关键参数
-const float MM_PER_UNIT = U100_VOLUME_PER_UNIT_MM3 / SYRINGE_AREA_MM3;
-const uint32_t STEPS_PER_UNIT = MM_PER_UNIT / MM_PER_STEP;
-const uint32_t STEPS_PER_005U = STEPS_PER_UNIT / 20;  // 0.05U = 1/20 U
-
-// 0.05U = 226 步（在推荐配置下）
+const float STEPS_PER_UNIT = (STEPS_PER_REV * MICROSTEP)
+                             / (MM_PER_STEP * SYRINGE_AREA_MM2 * 10.0);
+// 本项目实际 (RESERVOIR_TYPE=CY13_DANA, 8.65mm): STEPS_PER_UNIT≈2178, 0.05U=109 微步
 ```
 
 ### 4.3 基础率算法
@@ -278,8 +273,7 @@ uint32_t steps_per_3min(uint8_t basal_rate_x100) {
   // basal_rate_x100: 基础率 × 100（避免浮点）
   // 例：1.0 U/h → 100；0.5 U/h → 50
   float units_per_3min = (basal_rate_x100 / 100.0) * (3.0 / 60.0);
-  float units_per_3min_x005 = units_per_3min / 0.05;
-  return (uint32_t)(units_per_3min_x005 * STEPS_PER_005U);
+  return units_to_microsteps(units_per_3min);   // 经唯一换算入口, 不自行现算
 }
 ```
 

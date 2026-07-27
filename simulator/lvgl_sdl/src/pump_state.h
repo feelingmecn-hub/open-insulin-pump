@@ -4,6 +4,7 @@
 #pragma once
 
 #include "pump_types.h"
+#include "config.h"   // 引入 dosing.h: 换算 API 与全部几何常量 (单一真源) 对任何包含本头的 TU 可见
 
 // 实时状态 (所有任务读写, display 仅读)
 extern pump_runtime_state_t g_pump_state;
@@ -24,10 +25,7 @@ void pump_state_set_state(pump_state_t s);
 uint8_t crc8_ccitt(const uint8_t *data, size_t len);
 
 // ============================================================
-// 单位(U) ↔ 微步 统一换算 (与固件端保持一致, 0.5mm/rev · 1/32 微步 · 8.65mm 内腔(标准3ml注射器型))
-//   大剂量 / 基础率 / 排气 等所有「打药」路径都必须经这两个函数,
-//   0.05U(U-100) = STEPS_PER_005U ≈109 微步。
+// 单位(U) ↔ 微步 统一换算 (与固件端共用 dosing.h 单一真源, 由 config.h 引入)
+//   大剂量 / 基础率 / 排气 等所有「打药」路径都必须且只能经以下三函数,
+//   0.05U(U-100) = STEPS_PER_005U 自动由 dosing.h 推导。
 // ============================================================
-uint32_t units_to_microsteps(float units);   // 四舍五入到最近整数微步
-float   microsteps_to_units(uint32_t steps); // 反算
-float   quantize_units_005(float units);     // 吸附到 0.05U 最小精度网格

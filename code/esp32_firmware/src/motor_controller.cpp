@@ -1,5 +1,10 @@
 /**
  * motor_controller.cpp — DRV8825 步进电机 (Arduino + 硬件定时器 ISR)
+ *
+ * ★ 全系统唯一的「电机控制入口 ★: 大剂量 / 基础率 / 排气 / JOG / 回退 全部经
+ *   execute_command() 分发, 任何模块都不得绕过本文件直接驱动 STEP 引脚。
+ *   所有「单位(U)↔微步」换算一律调用 dosing.h 的 units_to_microsteps() 等三函数,
+ *   禁止在此处或别处自行拿 STEPS_PER_UNIT 现算。
  */
 #include "motor_controller.h"
 #include "ina226.h"

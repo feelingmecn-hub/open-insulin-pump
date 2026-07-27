@@ -35,8 +35,14 @@ set(SIM_SRC
 
 add_executable(simulator ${SIM_SRC})
 
+# 共享剂量换算单一真源: 固件与模拟器共用同一份 code/esp32_firmware/src/dosing.h, 杜绝算法双份。
+# 用 REALPATH 解析本机 ASCII 软链 (pump_sim -> .../simulator), 得到真实仓库根后再定位固件 src。
+get_filename_component(_SIM_REAL "${CMAKE_CURRENT_SOURCE_DIR}" REALPATH)
+get_filename_component(_PROJ_ROOT "${_SIM_REAL}/../.." REALPATH)
+
 target_include_directories(simulator PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${_PROJ_ROOT}/code/esp32_firmware/src
 )
 
 # 链接: LVGL (FetchContent 提供的 lvgl::lvgl) + SDL2

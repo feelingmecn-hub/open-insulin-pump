@@ -4,6 +4,29 @@
 
 ---
 
+## 2026-07-27（架构重构）— 储药罐类型配置化 + 剂量换算单一真源 (dosing.h)
+
+> 用户要求：储药罐类型应在配置里选、所有打药控制从一个参数出、所有算法从一个地方输出，
+> 不再东一块西一块地硬编码推导常数。
+
+- **储药罐类型配置化**：`config.h` 新增 `RESERVOIR_TYPE` 唯一选择点
+  （`RESERVOIR_TYPE_CY13_DANA` / `RESERVOIR_TYPE_CARTRIDGE_3ML`），每种类型给出内腔直径、
+  容量、`RESERVOIR_TYPE_NAME`。**切换耗材 = 改这一个宏**，几何/换算全自动重算。
+- **剂量换算单一真源 `dosing.h`**：新建 header-only 模块，从「内腔直径」单一参数推导
+  截面积 / 每转体积 / `STEPS_PER_UNIT` / `STEPS_PER_005U`，并定义
+  `units_to_microsteps()` / `microsteps_to_units()` / `quantize_units_005()` 三个函数。
+  固件与模拟器**共用同一份** `dosing.h`（模拟器 CMake 把固件 src 加入包含路径），杜绝算法双份。
+- **去重**：删除固件与模拟器两份 `pump_state.cpp` 中重复的换算函数定义；
+  删除 `config.h` 里手算硬编码的 `SYRINGE_AREA_MM2` / `STEPS_PER_UNIT` / `STEPS_PER_005U` 等常数
+  （连同过期的 `≈58.8` / `=109` 注释）。所有调用方仍只走唯一接口。
+- **电机控制唯一入口**：`motor_controller.cpp` 明确为全系统唯一电机驱动入口，
+  所有打药路径经 `execute_command()` 分发，且一律调用 `dosing.h` 换算，禁止自行现算。
+- **验证**：ninja 重编模拟器通过；编译测试程序确认 `RESERVOIR_TYPE=CY13_DANA` 时
+  0.05U=109 微步（+0.085%），切到 `CARTRIDGE_3ML` 自动变为 0.05U=88 微步（73.1mm²/1750 步每 U）。
+- **文档**：`docs/03`、`docs/05` 将硬编码示例片段改为指向 `dosing.h` 单一真源与 `RESERVOIR_TYPE` 配置。
+
+---
+
 ## 2026-07-27（二次更正）— 储药器类型澄清：9.65mm(卡式瓶) → 8.65mm(注射器型)
 
 > ⚠️ 上一条「（更正）」把本项目耗材当成了 **3mL 卡式瓶（笔芯，内径≈9.65mm）**，但经用户确认实际
