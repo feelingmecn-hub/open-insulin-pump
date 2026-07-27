@@ -24,6 +24,10 @@ bool motor_jog(motor_dir_t dir, uint16_t steps);
 void motor_set_home(void);
 // 通用入队 (BLE / 基础率任务调用)
 bool motor_enqueue(const motor_command_t *cmd);
+// 取消正在进行的大剂量 (置 abort 标志, 当前段完成后停止)
+void motor_cancel_bolus(void);
+// 大剂量是否正在进行
+bool motor_bolus_active(void);
 
 // 丢步/堵转监护
 void motor_start_stall_guard(void);

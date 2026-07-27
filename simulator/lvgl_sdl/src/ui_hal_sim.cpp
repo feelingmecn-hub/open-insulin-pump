@@ -55,3 +55,6 @@ bool ui_hal_toggle_keypad_sound(void)
 }
 
 void ui_hal_init(void) { /* 模拟器无需额外初始化 */ }
+
+bool ui_hal_bolus_active(void) { return false; }   // 模拟器无真实电机
+void ui_hal_cancel_bolus(void) { /* 模拟器无真实电机, 无需处理 */ }

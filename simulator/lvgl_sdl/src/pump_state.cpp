@@ -85,13 +85,13 @@ void pump_state_set_state(pump_state_t s)
 uint32_t units_to_microsteps(float units)
 {
     if (units <= 0.0f) return 0;
-    float steps = units * STEPS_PER_UNIT;
+    float steps = units * STEPS_PER_UNIT * DOSE_CALIBRATION;
     return (uint32_t)(steps + 0.5f);
 }
 
 float microsteps_to_units(uint32_t steps)
 {
-    return (float)steps / STEPS_PER_UNIT;
+    return (float)steps / (STEPS_PER_UNIT * DOSE_CALIBRATION);
 }
 
 float quantize_units_005(float units)

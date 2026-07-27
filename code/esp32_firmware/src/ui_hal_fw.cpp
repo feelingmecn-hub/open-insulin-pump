@@ -99,51 +99,39 @@ bool ui_hal_basal_local_mode(void)
 void ui_hal_deliver_bolus(float total_units, bolus_kind_t kind,
                           float duration_h, float immediate_units, float extended_units)
 {
-    (void)kind; (void)duration_h;
+    (void)total_units; (void)duration_h;
 
     // 安全限制
-    if (total_units < 0.01f) return;
-    if (total_units > g_pump_config.max_bolus_single) total_units = g_pump_config.max_bolus_single;
+    if (immediate_units < 0.01f && extended_units < 0.01f) return;
+    if (immediate_units > g_pump_config.max_bolus_single) immediate_units = g_pump_config.max_bolus_single;
+    if (extended_units  > g_pump_config.max_bolus_single) extended_units  = g_pump_config.max_bolus_single;
 
     // 吸附到 0.05U 最小精度网格 (全系统统一剂量精度, 见 quantize_units_005)
     immediate_units = quantize_units_005(immediate_units);
     extended_units  = quantize_units_005(extended_units);
 
-    // 立即量 → 入队电机命令
+    uint8_t k = (uint8_t)kind;
+
+    // 立即量 → 入队电机命令 (记账/历史/储药器扣减由 motor_controller 分段完成时统一处理,
+    // 以支持中途取消只损失已打部分; 此处只负责校验 + 入队)
     if (immediate_units > 0.001f) {
         motor_command_t cmd{0};
         cmd.type       = MOTOR_CMD_BOLUS;
         cmd.units_x100 = (uint32_t)(immediate_units * 100.0f + 0.5f);
+        cmd.kind       = k;
         motor_enqueue(&cmd);
-
-        // 统计与历史
-        uint32_t ux100 = (uint32_t)(immediate_units * 100.0f + 0.5f);
-        g_pump_state.today_units_x100 += ux100;
-        g_pump_state.total_units_x100_delivered += ux100;
-        g_pump_state.iob_x10000 += (uint32_t)(immediate_units * 10000.0f);
-        history_log_event(EVENT_TYPE_BOLUS, ALARM_NONE, ux100, 0);
     }
 
-    // 方波/双波延展量 → 作为第二条 bolus 入队 (总量正确, 时序未铺开)
-    // TODO: 完整的方波调度需在 basal_scheduler 中实现时间铺开
+    // 方波/双波延展量 → 作为第二条 bolus 入队 (总量正确, 时序铺开见下方 TODO)
+    // TODO: 完整的方波调度应在 basal_scheduler 中按 duration_h 时间维铺开,
+    //       而非作为一次性大剂量; 当前仅保证总量与分批安全。
     if (extended_units > 0.001f) {
         motor_command_t cmd{0};
         cmd.type       = MOTOR_CMD_BOLUS;
         cmd.units_x100 = (uint32_t)(extended_units * 100.0f + 0.5f);
+        cmd.kind       = k;
         motor_enqueue(&cmd);
-
-        uint32_t ux100 = (uint32_t)(extended_units * 100.0f + 0.5f);
-        g_pump_state.today_units_x100 += ux100;
-        g_pump_state.total_units_x100_delivered += ux100;
-        g_pump_state.iob_x10000 += (uint32_t)(extended_units * 10000.0f);
-        history_log_event(EVENT_TYPE_BOLUS, ALARM_NONE, ux100, 0);
     }
-
-    // 储药器扣减 (命令剂量; 若电机实际阻塞由安全模块另报)
-    pump_state_consume_units(immediate_units + extended_units);
-
-    // 持久化配置变更 (累计统计)
-    storage_save_config(&g_pump_config);
 }
 
 void ui_hal_start_prime(void)
@@ -186,4 +174,14 @@ void ui_hal_init(void)
 {
     s_keypad_sound = true;
     // 固件侧无需额外初始化; 各模块在 setup() 中已初始化
+}
+
+bool ui_hal_bolus_active(void)
+{
+    return motor_bolus_active();
+}
+
+void ui_hal_cancel_bolus(void)
+{
+    motor_cancel_bolus();
 }

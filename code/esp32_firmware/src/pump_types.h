@@ -62,6 +62,7 @@ typedef enum {
     MOTOR_CMD_STOP,
     MOTOR_CMD_REWIND,
     MOTOR_CMD_CALIBRATE,
+    MOTOR_CMD_CANCEL_BOLUS,   // 取消正在进行的大剂量 (置 abort 标志)
 } motor_cmd_type_t;
 
 typedef enum {
@@ -95,6 +96,7 @@ typedef struct {
     bool             is_extended;  // 是否为方波大剂量
     // 基础率专用
     float            rate_uh;      // 基础率速率 U/h
+    uint8_t          kind;         // 大剂量类型 (bolus_kind_t, 见 ui_hal.h)
 } motor_command_t;
 
 // ============================================================

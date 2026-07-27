@@ -78,5 +78,10 @@ void ui_hal_set_brightness(uint8_t pct);
 // 切换按键音开关 (返回切换后的状态)
 bool ui_hal_toggle_keypad_sound(void);
 
+// 大剂量是否正在进行 (供 UI 显示"注射中"与"ESC 取消")
+bool ui_hal_bolus_active(void);
+// 取消正在进行的大剂量 (只损失已打部分, 剩余停止)
+void ui_hal_cancel_bolus(void);
+
 // 后端初始化 (固件侧可在此初始化缓存/默认值)
 void ui_hal_init(void);

@@ -147,8 +147,21 @@
 #define UNITS_PER_STEP        (UL_PER_STEP / 10.0f)
 #define STEPS_PER_UNIT        (1.0f / UNITS_PER_STEP)
 #define STEPS_PER_005U        ((uint16_t)(STEPS_PER_UNIT * 0.05f))
-                                        // ≈ 403 微步 (0.05U)
+                                        // = 402 微步 (0.05U; 理论 402.4066, 取整)
 #define MIN_DOSE_UNITS        0.05f   // 最小给药精度 (U) — 全系统剂量网格
+
+// 剂量标定系数: 实际硬件导程/笔芯内径与标称存在制造偏差, 实测后修正。
+// 例: 实测打出 0.05U 实际为 0.051U → 标定 = 0.051/0.05 = 1.02。默认 1.0 (未标定)。
+// 该系数作用于唯一换算入口 units_to_microsteps(), 全系统剂量随之整体缩放。
+#define DOSE_CALIBRATION      1.0f
+
+// ---- 大剂量分批打入 (segmented bolus) ----
+// 真实胰岛素泵以「步进 + 段间停顿」方式给大剂量 (Wellion: 0.05U/步, 1s 间隔, ≈3U/min;
+// Medtronic 780G: 标准 1.5U/min, 快速 15U/min)。本固件采用同样策略:
+// 每批推 0.05U (最小精度网格), 段间停顿并复检安全 (阻塞/报警/储药器空), 支持中途取消。
+#define BOLUS_SEGMENT_UNITS       MIN_DOSE_UNITS   // 每批 0.05U
+#define BOLUS_SEGMENT_INTERVAL_MS 1000             // 段间停顿 1s → 约 3U/min
+#define BOLUS_SPEED_HZ            2000             // 单批内电机脉冲频率 (402 微步 ≈ 0.2s)
 
 #define MOTOR_MAX_SPEED_HZ    5000
 #define MOTOR_MIN_SPEED_HZ    500

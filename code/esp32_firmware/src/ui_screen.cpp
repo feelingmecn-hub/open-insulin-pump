@@ -189,7 +189,12 @@ static void draw_home(void)
     L(168, 114, buf, FONT_SM, TEXT);
 
     const char *st = g_pump_state.alarm_active ? "⚠ 报警" : state_str(g_pump_state.current_state);
-    L(4, 132, st, FONT_SM, g_pump_state.alarm_active ? RED : TEXT);
+    lv_color_t st_col = g_pump_state.alarm_active ? RED : TEXT;
+    if (ui_hal_bolus_active()) {            // 大剂量分段打入进行中
+        st = "大剂量注射中… (按 ESC 取消)";
+        st_col = ACCENT;
+    }
+    L(4, 132, st, FONT_SM, st_col);
     L(150, 132, "确认键进入菜单", FONT_SM, DIM);
 }
 
@@ -462,6 +467,11 @@ static void on_bolus_menu_enter(void)
 
 static void handle_key(key_event_t k)
 {
+    // 大剂量分段打入进行中时, ESC 优先取消 (只损失已打部分, 剩余停止)
+    if (k == KEY_ESC && ui_hal_bolus_active()) {
+        ui_hal_cancel_bolus();
+        return;
+    }
     switch (s_screen) {
         case SCR_HOME:
             if (k == KEY_SET) enter_child(SCR_MENU);

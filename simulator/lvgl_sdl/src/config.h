@@ -147,8 +147,11 @@
 #define UNITS_PER_STEP        (UL_PER_STEP / 10.0f)
 #define STEPS_PER_UNIT        (1.0f / UNITS_PER_STEP)
 #define STEPS_PER_005U        ((uint16_t)(STEPS_PER_UNIT * 0.05f))
-                                        // ≈ 403 微步 (0.05U)
+                                        // = 402 微步 (0.05U; 理论 402.4066, 取整)
 #define MIN_DOSE_UNITS        0.05f   // 最小给药精度 (U) — 全系统剂量网格
+
+// 剂量标定系数: 实际硬件导程/笔芯内径与标称存在制造偏差, 实测后修正。默认 1.0 (未标定)。
+#define DOSE_CALIBRATION      1.0f
 
 #define MOTOR_MAX_SPEED_HZ    5000
 #define MOTOR_MIN_SPEED_HZ    500

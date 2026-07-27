@@ -125,13 +125,14 @@ void pump_state_set_state(pump_state_t s)
 uint32_t units_to_microsteps(float units)
 {
     if (units <= 0.0f) return 0;
-    float steps = units * STEPS_PER_UNIT;   // STEPS_PER_UNIT ∈ config.h
+    // 唯一换算入口: 单位(U) → 微步。DOSE_CALIBRATION 用于实测标定整体缩放。
+    float steps = units * STEPS_PER_UNIT * DOSE_CALIBRATION;
     return (uint32_t)(steps + 0.5f);        // 四舍五入, 误差 < 1 微步 ≈ 0.00012U
 }
 
 float microsteps_to_units(uint32_t steps)
 {
-    return (float)steps / STEPS_PER_UNIT;
+    return (float)steps / (STEPS_PER_UNIT * DOSE_CALIBRATION);
 }
 
 // 吸附到 0.05U 最小精度网格: 0.05 的整数倍, 且不低于 MIN_DOSE_UNITS
