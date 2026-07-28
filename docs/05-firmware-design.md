@@ -513,19 +513,30 @@ float    quantize_units_005(float units);    // 吸附到 0.05U 网格
   取消正在打入的大剂量（首页底部显示「大剂量注射中… (按 ESC 取消)」）；BLE 控制通道亦可触发。
 - 基础率（0.5U/h → 每 3 分钟仅 ~0.025U ≈ 201 微步）本身已极慢，等价于「自然分段」，无需改动。
 
-### 6.2.3 方波 / 双波大剂量：按时间维铺开（Extended Bolus Time-Spread）
+### 6.2.3 方波 / 双波大剂量：按时间维连续慢滴（Extended Bolus Time-Spread）
+
+> 设计点：真实胰岛素泵的方波/延展量是「在 `duration` 内**匀速输注**」，机械上拆成微步
+> （Wellion：步间 ~1s），**绝非几分钟一跳**。初版曾把延展量挂在 3 分钟基础率节拍上、用
+> 大剂量快速度 burst 完再歇几分钟——这与真实泵行为不符，已改为**连续慢滴**。
 
 - **入口**：`ui_hal_deliver_bolus()`（固件后端 `ui_hal_fw.cpp`）把「立即量」作为一次性
-  `MOTOR_CMD_BOLUS` 入队；把「延展量」交给 `basal_scheduler_start_extended_bolus()`，
-  **不再作为第二条一次性大剂量入队**。
-- **驱动**：`basal_scheduler_task()` 每 `BASAL_TICK_INTERVAL_MS`（3 分钟）调用
-  `extended_bolus_tick()`，按「已过时间比例」计算本 tick 应铺开的量
-  `target = total × (elapsed / duration_ms)`，与已铺开量之差即本 tick 投递量。
-- **电机路径**：每个 tick 的微投递封装为 `MOTOR_CMD_BOLUS_EXT`，仍经 `execute_command()`
-  这一全系统唯一电机入口，换算统一走 `dosing.h`；记账（储药器/今日/累计/IOB）在入队时同步完成，
+  `MOTOR_CMD_BOLUS` 入队（常规大剂量本身已是 `0.05U/段 + 段间 1s` 的连续分段打入，见 §6.2.2）；
+  把「延展量」交给 `basal_scheduler_start_extended_bolus()`，**不再作为第二条一次性大剂量入队**。
+- **驱动（细拍连续慢滴）**：调度器循环以 `EXT_BOLUS_WINDOW_MS`（默认 15s）为细拍；基础率仍按
+  `BASAL_TICK_INTERVAL_MS`（3 分钟）窗口、每 `basal_div` 个细拍投递一次。每个细拍调用
+  `extended_bolus_tick()`，按「已过时间比例」算本拍应铺开量 `target = total × (elapsed/duration_ms)`，
+  与已铺开量之差即本拍投递量。
+- **匀速走丝杠（关键）**：本拍微投递按**方波速率** `rate_uh = total / (duration_h)` 换算成慢速
+  `steps_per_s = (rate_uh/3600) × STEPS_PER_UNIT`，作为 `MOTOR_CMD_BOLUS_EXT` 的 `speed_hz`
+  下发——电机在该 15s 窗口内**连续运行填满时间**，实现匀速连续慢滴；不再用 `BOLUS_SPEED_HZ`
+  快打后歇几分钟。单次投递下限 `EXT_BOLUS_MIN_UNITS = 0.005U`（远小于 0.05U 网格）以保证连续、
+  又避免极小量空转。
+- **电机路径**：每个细拍微投递封装为 `MOTOR_CMD_BOLUS_EXT`，仍经 `execute_command()` 这一
+  全系统唯一电机入口，换算统一走 `dosing.h`；记账（储药器/今日/累计/IOB）在入队时同步完成，
   与 `motor_deliver_bolus()` 的分段记账一致——中途取消或储药器空只损失未铺开部分。
 - **收尾**：时间到（`frac ≥ 1`）投递剩余零头，并写**一条** `EVENT_TYPE_BOLUS` 历史事件
   （与「立即量」分开记，双波 = 立即 + 延展两条事件），`total_bolus_count++` 持久化。
+- **调参**：`EXT_BOLUS_WINDOW_MS` 调小（如 5~10s）更平滑但队列流量增大；调大更省电但连续性略降。
 - **取消 / 安全**：`ui_hal_cancel_bolus()` 同时取消立即量（`motor_cancel_bolus()`）与延展量
   （`basal_scheduler_cancel_extended_bolus()`）；`ui_hal_bolus_active()` 在任一进行中均返回真。
   延展量投递前复检 `reservoir_units_left < 1`，空则中止并记为部分事件。

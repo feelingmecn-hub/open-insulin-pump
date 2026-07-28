@@ -60,9 +60,9 @@ static void ext_bolus_log_partial(void)
     g_pump_state.ext_bolus_active = false;
 }
 
-// 每个 basal tick 按"已过时间比例"投递一小段; 时间到收尾。
-// 记账(储药器/今日/IOB)在入队时同步进行, 与 motor_deliver_bolus 的分段记账一致,
-// 保证中途取消(或储药器空)只损失未铺开部分。
+// 每个细拍按"已过时间比例"投递一小段, 并按方波速率匀速走丝杠(连续慢滴);
+// 时间到收尾。记账(储药器/今日/IOB)在入队时同步进行, 与 motor_deliver_bolus 的
+// 分段记账一致, 保证中途取消(或储药器空)只损失未铺开部分。
 static void extended_bolus_tick(void)
 {
     if (!g_pump_state.ext_bolus_active) return;
@@ -87,20 +87,30 @@ static void extended_bolus_tick(void)
         return;
     }
 
-    // 仅在达到最小给药精度(0.05U)时才投递, 避免无效微步
-    if (this_tick >= MIN_DOSE_UNITS) {
+    // 方波速率 (U/h) → 走丝杠慢速 (steps/s), 使本窗口电机连续运行填满时间,
+    // 实现匀速连续慢滴(贴近真实泵 "均匀输注, 步间 ~1s"), 而非用 BOLUS_SPEED_HZ 快打后歇几分钟。
+    float rate_uh     = (g_pump_state.ext_bolus_duration_ms > 0)
+                            ? (total / (g_pump_state.ext_bolus_duration_ms / 3600000.0f))
+                            : total;   // 退化一次性不会走到这里
+    float steps_per_s = (rate_uh / 3600.0f) * (float)STEPS_PER_UNIT;
+    uint16_t slow_hz  = (uint16_t)(steps_per_s + 0.5f);
+    if (slow_hz < 1) slow_hz = 1;
+
+    // 仅在达到极小下限时才投递, 避免无效微步空转; 远小于 0.05U 网格以保持连续
+    if (this_tick >= EXT_BOLUS_MIN_UNITS) {
         motor_command_t cmd{0};
         cmd.type       = MOTOR_CMD_BOLUS_EXT;
         cmd.units_x100 = (uint32_t)(this_tick * 100.0f + 0.5f);
         cmd.kind       = g_pump_state.ext_bolus_kind;
-        cmd.speed_hz   = BOLUS_SPEED_HZ;
+        cmd.speed_hz   = slow_hz;
         if (motor_enqueue(&cmd)) {
             pump_state_consume_units(this_tick);
             uint32_t ux100 = (uint32_t)(this_tick * 100.0f + 0.5f);
             g_pump_state.today_units_x100           += ux100;
             g_pump_state.total_units_x100_delivered += ux100;
             g_pump_state.iob_x10000                 += (uint32_t)(this_tick * 10000.0f);
-            g_pump_state.ext_bolus_delivered_x100    = (uint32_t)(target * 100.0f + 0.5f);
+            // 累计「实际投递量」(而非时间目标), 使下一拍 delta 自动对齐时间目标, 避免逐拍舍入漂移
+            g_pump_state.ext_bolus_delivered_x100    += ux100;
         }
     }
 
@@ -112,7 +122,7 @@ static void extended_bolus_tick(void)
             cmd.type       = MOTOR_CMD_BOLUS_EXT;
             cmd.units_x100 = (uint32_t)(rem * 100.0f + 0.5f);
             cmd.kind       = g_pump_state.ext_bolus_kind;
-            cmd.speed_hz   = BOLUS_SPEED_HZ;
+            cmd.speed_hz   = slow_hz;
             if (motor_enqueue(&cmd)) {
                 pump_state_consume_units(rem);
                 uint32_t rx100 = (uint32_t)(rem * 100.0f + 0.5f);
@@ -170,30 +180,40 @@ void basal_scheduler_init(void)
 void basal_scheduler_task(void *arg)
 {
     (void)arg;
+    // 调度器细拍 = min(延展量窗口, 基础率窗口): 延展量连续慢滴用细拍, 基础率仍按
+    // BASAL_TICK_INTERVAL_MS(3 分钟)窗口每 basal_div 个细拍投递一次。
+    const uint32_t loop_ms = (EXT_BOLUS_WINDOW_MS > 0 && EXT_BOLUS_WINDOW_MS < BASAL_TICK_INTERVAL_MS)
+                                 ? EXT_BOLUS_WINDOW_MS : BASAL_TICK_INTERVAL_MS;
+    const uint32_t basal_div = (loop_ms > 0) ? (BASAL_TICK_INTERVAL_MS / loop_ms) : 1;
+
+    uint32_t tick = 0;
     for (;;) {
         float rate = basal_rate_for_now();
         g_pump_state.current_basal_rate = rate;   // 反映给状态屏/蓝牙
 
-        // 本 tick 应输注的药量: rate * 间隔 / 3600
-        float units = rate * (BASAL_TICK_INTERVAL_MS / 3600000.0f);
-        if (units > 0.0005f) {
-            motor_command_t cmd{0};
-            cmd.type      = MOTOR_CMD_BASAL_TICK;
-            cmd.units_x100 = (uint32_t)(units * 100.0f + 0.5f);
-            cmd.rate_uh   = rate;
-            motor_enqueue(&cmd);
+        // 基础率: 每 basal_div 个细拍投递一次 3 分钟窗口量
+        if (tick % basal_div == 0) {
+            float units = rate * (BASAL_TICK_INTERVAL_MS / 3600000.0f);
+            if (units > 0.0005f) {
+                motor_command_t cmd{0};
+                cmd.type      = MOTOR_CMD_BASAL_TICK;
+                cmd.units_x100 = (uint32_t)(units * 100.0f + 0.5f);
+                cmd.rate_uh   = rate;
+                motor_enqueue(&cmd);
 
-            // 统计 + 历史 + 储药器
-            g_pump_state.today_units_x100          += cmd.units_x100;
-            g_pump_state.total_units_x100_delivered += cmd.units_x100;
-            pump_state_consume_units(units);
-            history_log_event(EVENT_TYPE_BASAL_RATE, ALARM_NONE,
-                              cmd.units_x100, (uint16_t)(rate * 100.0f));
+                // 统计 + 历史 + 储药器
+                g_pump_state.today_units_x100          += cmd.units_x100;
+                g_pump_state.total_units_x100_delivered += cmd.units_x100;
+                pump_state_consume_units(units);
+                history_log_event(EVENT_TYPE_BASAL_RATE, ALARM_NONE,
+                                  cmd.units_x100, (uint16_t)(rate * 100.0f));
+            }
         }
 
-        // ---- 方波/双波延展量: 按时间比例在每 tick 铺开一小段 ----
+        // ---- 方波/双波延展量: 细拍连续慢滴(每窗口按方波速率匀速走丝杠) ----
         extended_bolus_tick();
 
-        vTaskDelay(pdMS_TO_TICKS(BASAL_TICK_INTERVAL_MS));
+        tick++;
+        vTaskDelay(pdMS_TO_TICKS(loop_ms));
     }
 }
