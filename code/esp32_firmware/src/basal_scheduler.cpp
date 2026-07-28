@@ -8,6 +8,7 @@
 #include "motor_controller.h"
 #include "history_log.h"
 #include "storage.h"
+#include "iob_model.h"      // IOB 衰减模型
 
 // 取当前整点应执行的基础率 (U/h)
 static float basal_rate_for_now(void)
@@ -52,6 +53,8 @@ static void ext_bolus_log_partial(void)
 {
     uint32_t delivered = g_pump_state.ext_bolus_delivered_x100;
     if (delivered > 0) {
+        // 延展量取消: 把 IOB 记录裁剪为"实际已投递量", 不夸大未投递部分
+        iob_record_extended_cancel(millis(), (float)delivered / 100.0f);
         g_pump_config.total_bolus_count++;
         history_log_event(EVENT_TYPE_BOLUS, ALARM_NONE, delivered,
                           (uint16_t)g_pump_state.ext_bolus_kind);
@@ -108,7 +111,7 @@ static void extended_bolus_tick(void)
             uint32_t ux100 = (uint32_t)(this_tick * 100.0f + 0.5f);
             g_pump_state.today_units_x100           += ux100;
             g_pump_state.total_units_x100_delivered += ux100;
-            g_pump_state.iob_x10000                 += (uint32_t)(this_tick * 10000.0f);
+            // IOB 由 iob_record_extended_start 统一记录, iob_recompute 衰减 (此处不再累加)
             // 累计「实际投递量」(而非时间目标), 使下一拍 delta 自动对齐时间目标, 避免逐拍舍入漂移
             g_pump_state.ext_bolus_delivered_x100    += ux100;
         }
@@ -128,7 +131,7 @@ static void extended_bolus_tick(void)
                 uint32_t rx100 = (uint32_t)(rem * 100.0f + 0.5f);
                 g_pump_state.today_units_x100           += rx100;
                 g_pump_state.total_units_x100_delivered += rx100;
-                g_pump_state.iob_x10000                 += (uint32_t)(rem * 10000.0f);
+                // IOB 已由 iob_record_extended_start 记录 (延展量记录继续衰减, 此处不再累加)
                 g_pump_state.ext_bolus_delivered_x100    = g_pump_state.ext_bolus_total_x100;
             }
         }
@@ -159,6 +162,9 @@ void basal_scheduler_start_extended_bolus(float units, float duration_h, uint8_t
     g_pump_state.ext_bolus_delivered_x100 = 0;
     g_pump_state.ext_bolus_duration_ms    = (uint32_t)(duration_h * 3600000.0f);
     g_pump_state.ext_bolus_start_ms       = millis();
+    // IOB: 记录延展量开始, iob_recompute 按线性投递解析积分 (正确反映输注期间爬升+完成后衰减)
+    iob_record_extended_start(units, g_pump_state.ext_bolus_duration_ms,
+                              g_pump_state.ext_bolus_start_ms);
 }
 
 void basal_scheduler_cancel_extended_bolus(void)
@@ -212,6 +218,9 @@ void basal_scheduler_task(void *arg)
 
         // ---- 方波/双波延展量: 细拍连续慢滴(每窗口按方波速率匀速走丝杠) ----
         extended_bolus_tick();
+
+        // 周期重算 IOB (按活性曲线衰减), 写 g_pump_state.iob_x10000
+        iob_recompute();
 
         tick++;
         vTaskDelay(pdMS_TO_TICKS(loop_ms));

@@ -171,6 +171,13 @@
 
 
 
+// ---- 大剂量分批打入 (segmented bolus) ----
+// 真实胰岛素泵以「步进 + 段间停顿」方式给大剂量 (Wellion: 0.05U/步, 1s 间隔, ≈3U/min;
+// Medtronic 780G: 标准 1.5U/min, 快速 15U/min)。本固件采用同样策略:
+// 每批推 0.05U (最小精度网格), 段间停顿并复检安全 (阻塞/报警/储药器空), 支持中途取消。
+#define BOLUS_SEGMENT_UNITS       MIN_DOSE_UNITS   // 每批 0.05U
+#define BOLUS_SEGMENT_INTERVAL_MS 1000             // 段间停顿 1s → 约 3U/min
+#define BOLUS_SPEED_HZ            500
 #define MOTOR_MAX_SPEED_HZ    5000
 #define MOTOR_MIN_SPEED_HZ    500
 #define MOTOR_ACCEL_HZ        2000
@@ -218,6 +225,16 @@
 #define MAX_RESERVOIR_UNITS    RESERVOIR_CAPACITY_U
 #define IOB_DURATION_HOURS     4.0f
 
+// ---- 方波/双波延展量: 连续慢滴窗口 ----
+// 真实胰岛素泵的方波/延展量是「在 duration 内匀速输注」, 机械上拆成微步(Wellion:
+// 步间 ~1s), 而非几分钟一跳。本固件据此把延展量改为细拍连续慢滴:
+//   · 每 EXT_BOLUS_WINDOW_MS 计算一次「按方波速率匀速走丝杠」的微投递, 使电机在该
+//     窗口内连续运行(而非用 BOLUS_SPEED_HZ 快打后歇几分钟), 贴合真实泵行为。
+//   · 该窗口同时作为调度器细拍; 基础率仍按 BASAL_TICK_INTERVAL_MS(3 分钟)窗口投递。
+//   · 调小窗口(如 5000~10000)更平滑但队列流量增大; 调大则更省电但连续性略降。
+#define EXT_BOLUS_WINDOW_MS   15000   // 细节拍 / 连续慢滴窗口 (ms)
+#define EXT_BOLUS_MIN_UNITS   0.005f  // 延展量单次投递下限 (U), 远低于 0.05U 网格以保连续, 防极小量空转
+
 // ============================================================
 // 12. 安全参数
 // ============================================================
@@ -236,6 +253,7 @@
 #define TASK_PRIORITY_MOTOR     8
 #define TASK_PRIORITY_BLE       6
 #define TASK_PRIORITY_BATTERY   5
+#define TASK_PRIORITY_BASAL     5
 #define TASK_PRIORITY_DISPLAY    4
 #define TASK_PRIORITY_KEYPAD     4
 #define TASK_PRIORITY_STORAGE   3
@@ -245,6 +263,7 @@
 #define STACK_SIZE_MOTOR     4096
 #define STACK_SIZE_BLE       8192
 #define STACK_SIZE_BATTERY   2048
+#define STACK_SIZE_BASAL     2048
 #define STACK_SIZE_DISPLAY   6144
 #define STACK_SIZE_KEYPAD    2048
 #define STACK_SIZE_STORAGE   4096
@@ -279,6 +298,44 @@
 #define BLE_CHAR_RESERVOIR_UUID     { 0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, \
                                       0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, \
                                       0x07, 0x00, 0x40, 0x6E }
+// CGM 血糖回传 (手机/AAPS → 泵): 写入 [mgdl u16][trend i8][crc]
+#define BLE_CHAR_CGM_UUID           { 0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, \
+                                      0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, \
+                                      0x08, 0x00, 0x40, 0x6E }
+// 控制通道 (手机 → 泵): 写入 [loop_mode u8][crc] / 或 [cmd u8][crc]
+#define BLE_CHAR_CONTROL_UUID       { 0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, \
+                                      0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, \
+                                      0x09, 0x00, 0x40, 0x6E }
+// 设置通道 (独立伴生 App ↔ 泵, 与 AAPS/Dana 互不干扰): 读写设备设置
+//   命令 [op u8][payload...][crc]; op: 0x01 GET_TIME / 0x02 SET_TIME(u32 Unix)
+//   0x03 GET_BRIGHTNESS / 0x04 SET_BRIGHTNESS(u8) / 0x05 GET_KEYPAD / 0x06 SET_KEYPAD(u8)
+//   0x10 GET_ACTIVE_PROFILE / 0x11 SET_ACTIVE_PROFILE(u8) / 0x12 GET_DIA_MIN / 0x13 SET_DIA_MIN(u16)
+//   响应: GET 命令将结果写入本特征, App 读取; SET 命令回 1 字节 ack(0=OK/1=ERR)
+#define BLE_CHAR_SETTINGS_UUID      { 0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, \
+                                      0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, \
+                                      0x0A, 0x00, 0x40, 0x6E }
+
+// ============================================================
+// 15. AAPS Dana-i impersonation（方案 B，编译期开关）
+// ============================================================
+// 默认关闭：保持现有自定义 BLE（本地伴生 APP 调试通道）不受影响。
+// 启用方式：在 Arduino IDE 编译选项中添加宏 -DUSE_AAPS_DANA。
+//   启用后设备蓝牙名变为 DANAI_DEVICE_NAME，并额外暴露 FFF0/FFF1/FFF2 服务，
+//   被 AndroidAPS 当作 Dana-i 直接识别与驱动（详见 docs/12）。
+// ⚠️ 实验项目，禁止用于人体。
+#ifndef USE_AAPS_DANA
+  // #define USE_AAPS_DANA   // ← 取消注释（或编译时 -DUSE_AAPS_DANA）以启用
+#endif
+#ifdef USE_AAPS_DANA
+  #ifndef DANAI_DEVICE_NAME
+    #define DANAI_DEVICE_NAME  "DAN12345AB"   // 10 字符, 匹配 ^[a-zA-Z]{3}[0-9]{5}[a-zA-Z]{2}$
+  #endif
+  #ifndef DANAI_BLE5_KEY
+    #define DANAI_BLE5_KEY     "123456"        // 6 位 ASCII 数字
+  #endif
+  #define DANAI_HW_MODEL    0x09               // Dana-i (0x0A 亦可)
+  #define DANAI_PROTOCOL    0x0A
+#endif
 
 #include "dosing.h"
 

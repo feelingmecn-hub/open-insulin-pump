@@ -1,6 +1,6 @@
 # OpenLoop Pump — Android 控制端
 
-开源 DIY 闭环胰岛素泵的手机控制 APP，通过 BLE 5.0 直接控制 ESP32-C3 泵，
+开源 DIY 闭环胰岛素泵的手机控制 APP，通过 BLE 5.0 直接控制 ESP32-C6 泵，
 并提供闭环算法、CGM 集成、Nightscout 云端同步。
 
 > ⚠️ 本项目为 DIY 开源项目，**非医疗器械**，仅供研究与学习，使用风险自负。
@@ -52,7 +52,7 @@ app/src/main/java/com/openloop/pump/
 
 ## 3. 与固件协议对接（关键）
 
-APP 的 BLE 协议**必须与 ESP32-C3 固件 `code/esp32_firmware/` 完全一致**：
+APP 的 BLE 协议**必须与 ESP32-C6 固件 `code/esp32_firmware/` 完全一致**：
 
 - **基础 UUID**：`6E400001-B5A3-F393-E0A9-E50E24DCCA9E`（Nordic UART 风格）
 - **特征**：BOLUS(`…0002`)、BASAL(`…0003`)、TBR(`…0004`)、STATUS(`…0005`)、IOB(`…0006`)、RESERVOIR(`…0007`)

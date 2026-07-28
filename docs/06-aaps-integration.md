@@ -54,14 +54,14 @@ AAPS Core → Pump Driver Interface → [具体泵实现]
 
 ### 2.1 方案 A：Medtronic 协议仿真
 
-**原理**：ESP32-C3 仿真老款 Medtronic 泵（如 712/715/722）的 RF 协议，让 AAPS 通过 RileyLink-like 桥连接。
+**原理**：ESP32-C6 仿真老款 Medtronic 泵（如 712/715/722）的 RF 协议，让 AAPS 通过 RileyLink-like 桥连接。
 
 **优点**：AAPS 代码完全不需要改动。
 
 **缺点**：
 - 需要逆向 Medtronic 715/722 的 sub-GHz 协议（难度高）
 - 需要 RFM69/RFM95 模块（增加成本）
-- ESP32-C3 的软件栈很复杂
+- ESP32-C6 的软件栈很复杂
 
 **结论**：**不推荐**。需要硬件改动（增加 sub-GHz 射频模块），不符合 ESP32-C6 + DRV8825 的简化目标。
 

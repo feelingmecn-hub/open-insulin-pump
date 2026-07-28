@@ -17,16 +17,25 @@
 #include "lvgl.h"
 #include "ui_screen.h"
 #include "mock_hal.h"
+#include "ui_hal.h"
 #include "config.h"
+
+#ifdef SIM_LINK_MODE
+#include "link_session.h"
+#include "link_ipc.h"
+#endif
 
 #include <SDL2/SDL.h>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
+#include <chrono>
+#include <thread>
 
 // ---- 离屏截图模式: 设置 SIM_SHOT=1 时, 用 SDL 虚拟驱动跑 LVGL,
 //      把渲染出的 320×172 像素存成 BMP 后退出 (无需真实屏幕, 用于预览/CI) ----
-static bool     s_headless = false;
+static bool     s_headless = false;     // 截图模式 (无窗口, 跑完即退出)
+static bool     s_link_headless = false; // 联调无窗口模式: 仅跑会话引擎 + TCP 通道
 static bool     s_dump_raw = false;
 static const char *s_shot_path = "/tmp/sim_shot.bmp";
 
@@ -147,6 +156,7 @@ static void handle_events(void)
                 case SDLK_KP_ENTER: ui_screen_key(KEY_SET); break;
                 case SDLK_ESCAPE: ui_screen_key(KEY_ESC); break;
                 // 快速演示快捷键
+#ifndef SIM_LINK_MODE
                 case SDLK_a: mock_event('a'); break;
                 case SDLK_c: mock_event('c'); break;
                 case SDLK_s: mock_event('s'); break;
@@ -155,6 +165,12 @@ static void handle_events(void)
                 case SDLK_p: mock_event('p'); break;
                 case SDLK_e: mock_event('e'); break;
                 case SDLK_r: mock_event('r'); break;
+#else
+                // 联调模式: space=播放/暂停, n=单步, r=重置
+                case SDLK_SPACE: linksess::set_playing(!linksess::playing()); linkipc::broadcast_status(); break;
+                case SDLK_n:     linksess::step(); linkipc::broadcast_status(); break;
+                case SDLK_r:     linksess::reset(); linkipc::broadcast_reset(); break;
+#endif
                 case SDLK_q: s_running = false; break;
                 default: break;
             }
@@ -162,18 +178,31 @@ static void handle_events(void)
     }
 }
 
+#ifdef SIM_LINK_MODE
+static uint32_t g_link_last = 0;
+static void link_tick(uint32_t now)
+{
+    if (!linksess::playing()) return;
+    if (now - g_link_last < (uint32_t)linksess::delay_ms()) return;
+    g_link_last = now;
+    bool more = linksess::step();
+    linkipc::broadcast_status();
+    if (!more) linksess::set_playing(false);
+}
+#endif
+
 int main(void)
 {
-    // ---------- 离屏截图模式? ----------
     const char *shot = getenv("SIM_SHOT");
     if (shot && shot[0] != '\0') {
         s_headless = true;
         if (shot[0] != '1' && shot[0] != '0') s_shot_path = shot;  // 当成路径
     }
     if (getenv("SIM_RAW")) s_dump_raw = true;
+    if (getenv("SIM_HEADLESS")) s_link_headless = true;
 
-    // ---------- SDL2 初始化 (交互模式才需要窗口) ----------
-    if (!s_headless) {
+    // ---------- SDL2 初始化 (交互/截图模式才需要窗口) ----------
+    if (!s_headless && !s_link_headless) {
         if (SDL_Init(SDL_INIT_VIDEO) != 0) {
             SDL_Log("SDL_Init failed: %s", SDL_GetError());
             return 1;
@@ -218,7 +247,16 @@ int main(void)
     lv_indev_set_read_cb(indev, mouse_read);
 
     ui_screen_init();   // 创建与固件一致的状态屏 + 底部控制按钮
+
+#ifdef SIM_LINK_MODE
+    // 联调演示模式: 用真实固件命令分发核心 (aaps_dana.cpp) 驱动 g_pump_state,
+    // 泵屏幕每帧从 g_pump_state 重绘 -> 与 AAPS 命令严格同步。键盘 space/n/r 控制播放。
+    ui_hal_init();
+    linksess::init();
+    linkipc::start();
+#else
     mock_init();        // 初始化状态机 + 启动自动演示
+#endif
 
     // ---------- 离屏截图模式: 渲染各主要页面后存图退出 ----------
     if (s_headless) {
@@ -232,15 +270,23 @@ int main(void)
             { UI_ALARM_LIST,   "/tmp/sim_alarm.bmp",    true,  4 },
             { UI_LOOP,         "/tmp/sim_loop.bmp",     false, 0 },
             { UI_SETTINGS,     "/tmp/sim_settings.bmp", false, 0 },
+            { UI_CLOCK_SET,    "/tmp/sim_clock.bmp",    false, 0 },
+            { UI_ABOUT,        "/tmp/sim_about.bmp",    false, 0 },
         };
         int n = (int)(sizeof(shots) / sizeof(shots[0]));
         for (int s = 0; s < n; s++) {
-            if (shots[s].alarm) mock_event('a');          // 让对应报警激活
+            if (shots[s].alarm) {
+#ifndef SIM_LINK_MODE
+                mock_event('a');          // 让对应报警激活
+#endif
+            }
             ui_set_screen(shots[s].scr);
             for (int j = 0; j < shots[s].nsel; j++) ui_screen_key(KEY_DOWN);
             for (int i = 0; i < 30; i++) {
                 lv_tick_inc(16);
+#ifndef SIM_LINK_MODE
                 mock_tick((uint32_t)((s * 1000 + i) * 16));
+#endif
                 ui_screen_refresh();
                 lv_timer_handler();
             }
@@ -252,6 +298,27 @@ int main(void)
         return 0;
     }
 
+#ifdef SIM_LINK_MODE
+    // ---------- 联调无窗口模式 (SIM_HEADLESS=1): 仅跑会话引擎 + TCP 控制通道 ----------
+    // 跳过 SDL 窗口, 由 Python 控制面板的 canvas 镜像充当唯一画面; 服务器常驻,
+    // 接收 play/pause/step/reset/delay 指令按节奏推进 AAPS 会话。
+    if (s_link_headless) {
+        auto t0 = std::chrono::steady_clock::now();
+        printf("[link] 无窗口联调模式: 会话引擎 + TCP 控制通道 127.0.0.1:%d 已就绪 (Ctrl-C 退出)\n", 18923);
+        fflush(stdout);
+        while (s_running) {
+            auto now = std::chrono::steady_clock::now();
+            uint32_t ms = (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                              now - t0).count();
+            link_tick(ms);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        free(s_pixels);
+        free(s_draw_buf);
+        return 0;
+    }
+#endif
+
     // ---------- 主循环 ----------
     uint32_t last = SDL_GetTicks();
     while (s_running) {
@@ -261,7 +328,11 @@ int main(void)
         lv_tick_inc(now - last);
         last = now;
 
+#ifdef SIM_LINK_MODE
+        link_tick(now);        // 联调模式: 按播放节奏推进 AAPS 会话 (驱动 g_pump_state)
+#else
         mock_tick(now);        // 推进模拟场景
+#endif
         ui_screen_refresh();   // 从 g_pump_state 刷新 label / 菜单
         lv_timer_handler();    // 渲染 (含按钮点击响应)
 

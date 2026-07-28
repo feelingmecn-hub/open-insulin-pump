@@ -21,7 +21,7 @@ static bool     g_override = false;
 // ---- 演示数据 ----
 static float  g_basal[24];
 static float  g_glucose = 6.5f;   // mmol/L
-static int8_t g_trend   = 0;      // -1/0/1
+static int8_t g_trend   = 0;      // -2 速降 / -1 缓降 / 0 平稳 / +1 缓升 / +2 速升
 static float  g_today   = 12.5f;  // 今日总量 U
 static int    g_hh = 8, g_mm = 30;
 static float  g_tbr_pct   = 0;    // 临时基础率百分比 (0=无)
@@ -91,7 +91,13 @@ void mock_tick(uint32_t now_ms)
         // CGM: 5 分钟周期正弦波动
         float prev = g_glucose;
         g_glucose = 6.5f + 1.2f * sinf((float)el / 60000.0f * 3.14159f * 2.0f / 5.0f);
-        g_trend = (g_glucose > prev + 0.02f) ? 1 : (g_glucose < prev - 0.02f) ? -1 : 0;
+        // 由斜率映射为 5 档显示码 (-2..2), 与固件 ui_hal_glucose_trend 契约一致
+        float slope = g_glucose - prev;
+        if (slope > 0.10f)       g_trend = 2;
+        else if (slope > 0.03f)  g_trend = 1;
+        else if (slope < -0.10f) g_trend = -2;
+        else if (slope < -0.03f) g_trend = -1;
+        else                     g_trend = 0;
         g_pump_state.last_glucose_mgdl = (uint16_t)(g_glucose * 18.0f);
         g_pump_state.glucose_trend = g_trend;
 

@@ -21,6 +21,7 @@
 #include "lcd_display.h"
 #include "history_log.h"
 #include "storage.h"
+#include "rtc_clock.h"   // 时钟读写
 
 // ---- 内部状态 ----
 static bool s_keypad_sound = true;
@@ -39,7 +40,18 @@ float ui_hal_glucose_mmol(void)
 
 int8_t ui_hal_glucose_trend(void)
 {
-    return (int8_t)g_pump_state.glucose_trend;
+    return (int8_t)g_pump_state.glucose_trend;   // 已为 5 档显示码 -2..2
+}
+
+bool ui_hal_glucose_valid(void)
+{
+    if (g_pump_state.last_glucose_mgdl == 0) return false;   // 无数据
+    if (!rtc_is_set()) return true;                          // 时钟未设置则不做过期判定
+    uint32_t now = rtc_unix_now();
+    if (now == 0) return true;
+    uint32_t age = (now > g_pump_state.last_glucose_time_unix)
+                   ? (now - g_pump_state.last_glucose_time_unix) : 0;
+    return age <= 600u;                                       // 超 10 分钟判离线
 }
 
 uint8_t ui_hal_loop_mode(void)
@@ -69,10 +81,12 @@ float ui_hal_today_total(void)
 
 void ui_hal_get_clock(int *hh, int *mm)
 {
-    // 简单运行时钟 (从开机计时), 后续可接 RTC 或 AAPS 同步
-    uint32_t sec = (uint32_t)(millis() / 1000UL);
-    *hh = (int)((sec / 3600UL) % 24UL);
-    *mm = (int)((sec / 60UL) % 60UL);
+    // RTC 风格时钟: 由 rtc_clock 维护的可设置/持久化时间
+    uint32_t u = rtc_unix_now();
+    if (u == 0) { *hh = -1; *mm = -1; return; }   // 未设置
+    int y, mo, d, h, mi, s;
+    rtc_unix_to_ymdhms(u, &y, &mo, &d, &h, &mi, &s);
+    *hh = h; *mm = mi;
 }
 
 int ui_hal_basal_count(void)
@@ -157,7 +171,10 @@ void ui_hal_clear_alarm(void)
 
 void ui_hal_set_brightness(uint8_t pct)
 {
+    if (pct > 100) pct = 100;
+    g_pump_config.display_brightness = pct;   // 持久化, 供 App/UI 读取同一份
     lcd_display_backlight(pct);
+    storage_save_config(&g_pump_config);
 }
 
 bool ui_hal_toggle_keypad_sound(void)
@@ -168,8 +185,28 @@ bool ui_hal_toggle_keypad_sound(void)
 
 void ui_hal_init(void)
 {
-    s_keypad_sound = true;
-    // 固件侧无需额外初始化; 各模块在 setup() 中已初始化
+    s_keypad_sound = (g_pump_config.keypad_sound != 0);
+    lcd_display_backlight(g_pump_config.display_brightness);  // 开机应用存储的亮度
+    // 固件侧其余初始化在各模块 setup() 中完成
+}
+
+// ---- 时钟 ----
+bool ui_hal_clock_valid(void)    { return rtc_is_set(); }
+void ui_hal_set_time(uint32_t unix_sec) { rtc_set_unix(unix_sec); }
+void ui_hal_set_time_ymdhms(int y, int mo, int d, int h, int mi, int s)
+{
+    rtc_set_unix(rtc_ymdhms_to_unix(y, mo, d, h, mi, s));
+}
+
+// ---- 显示 / 设置读取 ----
+uint8_t ui_hal_get_brightness(void) { return g_pump_config.display_brightness; }
+bool    ui_hal_dana_paired(void)    { return g_pump_state.dana_paired; }
+bool    ui_hal_get_keypad_sound(void) { return s_keypad_sound; }
+void    ui_hal_get_ymdhms(int *y, int *mo, int *d, int *h, int *mi, int *s)
+{
+    uint32_t u = rtc_unix_now();
+    if (u == 0) { *y = 2026; *mo = 1; *d = 1; *h = 0; *mi = 0; *s = 0; return; }
+    rtc_unix_to_ymdhms(u, y, mo, d, h, mi, s);
 }
 
 bool ui_hal_bolus_active(void)

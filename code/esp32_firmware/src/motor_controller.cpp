@@ -12,6 +12,7 @@
 #include "lcd_display.h"
 #include "history_log.h"
 #include "storage.h"
+#include "iob_model.h"     // IOB 衰减模型 (替代 iob_x10000 只增不减)
 
 #include <driver/gpio.h>
 #include <esp32-hal-timer.h>
@@ -158,7 +159,8 @@ static void motor_deliver_bolus(float total_units, uint8_t kind)
         uint32_t ux100 = (uint32_t)(this_units * 100.0f + 0.5f);
         g_pump_state.today_units_x100           += ux100;
         g_pump_state.total_units_x100_delivered += ux100;
-        g_pump_state.iob_x10000                 += (uint32_t)(this_units * 10000.0f);
+        // 注: IOB 不再此处累加, 由 iob_record_bolus 在整笔完成后统一记录,
+        //     并由 iob_recompute 按活性曲线衰减 (见 basal_scheduler_task)。
 
         // 段间停顿 (0.05U / 1s ≈ 3U/min, 贴合真实泵); 期间可被取消/报警打断
         if (delivered_steps < total_steps && !g_bolus_abort) {
@@ -172,6 +174,7 @@ static void motor_deliver_bolus(float total_units, uint8_t kind)
     // ---- 大剂量完成/中止: 记录历史 + 持久化累计统计 ----
     float actual = microsteps_to_units(delivered_steps);
     if (actual > 0.001f) {
+        iob_record_bolus(actual);   // 整笔完成后记录一笔, 交给 iob_recompute 衰减
         g_pump_config.total_bolus_count++;
         history_log_event(EVENT_TYPE_BOLUS, ALARM_NONE,
                           (uint32_t)(actual * 100.0f + 0.5f), (uint16_t)kind);

@@ -306,6 +306,36 @@
 #define BLE_CHAR_CONTROL_UUID       { 0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, \
                                       0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, \
                                       0x09, 0x00, 0x40, 0x6E }
+// 设置通道 (独立伴生 App ↔ 泵, 与 AAPS/Dana 互不干扰): 读写设备设置
+//   命令 [op u8][payload...][crc]; op: 0x01 GET_TIME / 0x02 SET_TIME(u32 Unix)
+//   0x03 GET_BRIGHTNESS / 0x04 SET_BRIGHTNESS(u8) / 0x05 GET_KEYPAD / 0x06 SET_KEYPAD(u8)
+//   0x10 GET_ACTIVE_PROFILE / 0x11 SET_ACTIVE_PROFILE(u8) / 0x12 GET_DIA_MIN / 0x13 SET_DIA_MIN(u16)
+//   响应: GET 命令将结果写入本特征, App 读取; SET 命令回 1 字节 ack(0=OK/1=ERR)
+#define BLE_CHAR_SETTINGS_UUID      { 0x9E, 0xCA, 0xDC, 0x24, 0x0E, 0xE5, \
+                                      0xA9, 0xE0, 0x93, 0xF3, 0xA3, 0xB5, \
+                                      0x0A, 0x00, 0x40, 0x6E }
+
+// ============================================================
+// 15. AAPS Dana-i impersonation（方案 B，编译期开关）
+// ============================================================
+// 默认关闭：保持现有自定义 BLE（本地伴生 APP 调试通道）不受影响。
+// 启用方式：在 Arduino IDE 编译选项中添加宏 -DUSE_AAPS_DANA。
+//   启用后设备蓝牙名变为 DANAI_DEVICE_NAME，并额外暴露 FFF0/FFF1/FFF2 服务，
+//   被 AndroidAPS 当作 Dana-i 直接识别与驱动（详见 docs/12）。
+// ⚠️ 实验项目，禁止用于人体。
+#ifndef USE_AAPS_DANA
+  // #define USE_AAPS_DANA   // ← 取消注释（或编译时 -DUSE_AAPS_DANA）以启用
+#endif
+#ifdef USE_AAPS_DANA
+  #ifndef DANAI_DEVICE_NAME
+    #define DANAI_DEVICE_NAME  "DAN12345AB"   // 10 字符, 匹配 ^[a-zA-Z]{3}[0-9]{5}[a-zA-Z]{2}$
+  #endif
+  #ifndef DANAI_BLE5_KEY
+    #define DANAI_BLE5_KEY     "123456"        // 6 位 ASCII 数字
+  #endif
+  #define DANAI_HW_MODEL    0x09               // Dana-i (0x0A 亦可)
+  #define DANAI_PROTOCOL    0x0A
+#endif
 
 #include "dosing.h"
 

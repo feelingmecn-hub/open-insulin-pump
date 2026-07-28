@@ -23,8 +23,10 @@
 
 // 当前血糖 mmol/L (来自 CGM / AAPS 回传)
 float   ui_hal_glucose_mmol(void);
-// 血糖趋势: -1 下降 / 0 平稳 / 1 上升
+// 血糖趋势: -2 速降 / -1 缓降 / 0 平稳 / +1 缓升 / +2 速升 (5 档)
 int8_t  ui_hal_glucose_trend(void);
+// 血糖是否有效 (有数据且未过期): false → UI 显"CGM 离线/无数据"
+bool    ui_hal_glucose_valid(void);
 // 闭环模式: 0 闭环(AAPS接管) / 1 开环(本地档案) / 2 暂停
 uint8_t ui_hal_loop_mode(void);
 // AAPS / 手机 连接状态
@@ -82,6 +84,20 @@ bool ui_hal_toggle_keypad_sound(void);
 bool ui_hal_bolus_active(void);
 // 取消正在进行的大剂量 (只损失已打部分, 剩余停止)
 void ui_hal_cancel_bolus(void);
+
+// ---- 时钟 (RTC 风格) ----
+// 时钟是否已设置 (false = 显示"未设置")
+bool    ui_hal_clock_valid(void);
+// 设置时间 (Unix 秒)
+void    ui_hal_set_time(uint32_t unix_sec);
+// 设置时间 (日历)
+void    ui_hal_set_time_ymdhms(int y, int mo, int d, int h, int mi, int s);
+
+// ---- 显示 / 设置读取 ----
+uint8_t ui_hal_get_brightness(void);    // 当前背光亮度 0-100
+bool    ui_hal_dana_paired(void);       // AAPS 是否完成 Dana 握手接管
+bool    ui_hal_get_keypad_sound(void);  // 当前按键音开关
+void    ui_hal_get_ymdhms(int *y, int *mo, int *d, int *h, int *mi, int *s); // 当前日期(未设置给默认)
 
 // 后端初始化 (固件侧可在此初始化缓存/默认值)
 void ui_hal_init(void);

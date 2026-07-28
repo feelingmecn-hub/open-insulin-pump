@@ -4,6 +4,7 @@
 #include "pump_state.h"
 #include "config.h"
 #include <string.h>
+#include <cstdio>
 
 pump_runtime_state_t g_pump_state;
 pump_config_t g_pump_config;
@@ -37,6 +38,49 @@ void pump_state_init(void)
     g_pump_config.lead_screw_pitch_mm   = LEAD_SCREW_PITCH_MM;
     g_pump_config.motor_microstep       = MOTOR_MICROSTEPS;
     g_pump_config.units_per_ml          = INSULIN_CONCENTRATION;
+
+    // 显示 / 用户设置默认
+    g_pump_config.display_brightness = 40;   // 默认 40% (Waveshare 高温警告建议 ≤50)
+    g_pump_config.keypad_sound       = 1;    // 默认开
+    g_pump_config.rtc_base_unix      = 0;    // 未设置时钟
+
+    // 内置默认基础率方案 (避免本地模式无方案导致 0 输注)
+    pump_config_apply_default_basal(&g_pump_config);
+}
+
+void pump_config_apply_default_basal(pump_config_t *cfg)
+{
+    if (!cfg) return;
+    const float def_rate = 0.5f;   // U/h, 全天恒定 (原型用, 可在 UI/App 调整)
+    for (uint8_t p = 0; p < MAX_BASAL_PROFILES; p++) {
+        snprintf(cfg->profiles[p].name, sizeof(cfg->profiles[p].name),
+                 p == 0 ? "默认" : "方案%d", p + 1);
+        for (int i = 0; i < BASAL_SLOTS_PER_DAY; i++) {
+            cfg->profiles[p].slots[i].hour    = (uint8_t)i;
+            cfg->profiles[p].slots[i].rate_uh = def_rate;
+        }
+    }
+}
+
+// 亚单位累加器: 避免 0.05U 这种小数反复 floor 丢失
+static float s_reservoir_frac = 0.0f;
+
+void pump_state_consume_units(float units)
+{
+    if (units <= 0.0f) return;
+    s_reservoir_frac += units;
+    uint16_t whole = (uint16_t)s_reservoir_frac;
+    if (whole > 0) {
+        if (whole >= g_pump_state.reservoir_units_left) {
+            whole = g_pump_state.reservoir_units_left;
+            s_reservoir_frac = 0.0f;
+            if (g_pump_state.reservoir_units_left == 0) {
+                pump_state_set_alarm(ALARM_RESERVOIR_EMPTY);
+            }
+        }
+        g_pump_state.reservoir_units_left -= whole;
+        s_reservoir_frac -= whole;
+    }
 }
 
 void pump_state_update_battery(uint16_t mv, uint8_t pct)

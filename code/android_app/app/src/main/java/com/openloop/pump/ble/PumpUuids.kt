@@ -3,7 +3,7 @@ package com.openloop.pump.ble
 import java.util.UUID
 
 /**
- * BLE UUID 与协议常量 —— 必须与 ESP32-C3 固件 [config.h] 完全一致。
+ * BLE UUID 与协议常量 —— 必须与 ESP32-C6 固件 [config.h] 完全一致。
  *
  * 基础 UUID: 6E400001-B5A3-F393-E0A9-E50E24DCCA9E
  * （Nordic UART Service 风格，固件以 little-endian 字节数组存储，

@@ -35,3 +35,6 @@ venv/
 
 # 日志
 *.log
+
+# 测试编译产物（源码见 *.cpp / *.py / *.sh，二进制不入库）
+code/esp32_firmware/test/aaps_dana_test

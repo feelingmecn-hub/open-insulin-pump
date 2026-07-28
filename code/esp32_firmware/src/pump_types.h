@@ -9,6 +9,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <cstddef>   // size_t (本头用到, 固件靠 Arduino.h 间接提供, 模拟器需显式引入以保证双端一致)
 
 // ============================================================
 // 状态机
@@ -148,6 +149,11 @@ typedef struct {
     uint8_t  watchdog_timeout_sec;        // 看门狗超时
     float    over_temp_threshold_c;       // 过温阈值
 
+    // --- 显示 / 用户设置 (持久化, 供本地 UI 与独立手机 App 共用) ---
+    uint8_t  display_brightness;          // 背光亮度 0-100 (%)
+    uint8_t  keypad_sound;                // 0=关 1=开
+    uint32_t rtc_base_unix;               // 时钟基准 Unix 秒 (0 = 未设置)
+
     // --- 统计 (累积) ---
     uint32_t total_units_x100_delivered;  // 累计注射单位 × 100
     uint32_t total_runtime_seconds;       // 累计运行秒数
@@ -178,8 +184,9 @@ typedef struct {
     uint16_t     reservoir_units_left;     // 剩余药量 (U)
     uint16_t     battery_mv;              // 电池电压 (mV)
     uint8_t      battery_pct;             // 电池百分比
-    uint16_t     last_glucose_mgdl;       // 最近血糖
-    int8_t       glucose_trend;           // CGM 趋势 (箭头方向)
+    uint16_t     last_glucose_mgdl;       // 最近血糖 (mg/dL; 自定义 BLE / Dana 0x48 双通路均写入此处)
+    int8_t       glucose_trend;           // CGM 趋势 5档显示码: -2 速降 / -1 缓降 / 0 平稳 / +1 缓升 / +2 速升
+    uint32_t     last_glucose_time_unix;  // 最近血糖接收时间 (Unix 秒; 离线/过期判定)
     uint32_t     iob_x10000;              // IOB × 10000
     uint32_t     last_bolus_time;         // 上次大剂量 Unix 时间
     uint32_t     last_basal_time;         // 上次基础率 Unix 时间
@@ -208,6 +215,8 @@ typedef struct {
     uint32_t ext_bolus_delivered_x100;  // 已铺开量 × 100
     uint32_t ext_bolus_duration_ms;     // 总时长 ms
     uint32_t ext_bolus_start_ms;        // 起始 millis()
+    // --- Dana / AAPS 接管状态 ---
+    bool     dana_paired;               // AAPS 已完成 Dana 握手接管 (闭环页区分显示)
 } pump_runtime_state_t;
 
 // ============================================================

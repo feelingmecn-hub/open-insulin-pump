@@ -1,0 +1,67 @@
+/**
+ * rtc_clock.h — 设备时钟 (ESP32 硬件 RTC 域, time()/settimeofday, 可手动/App 设置)
+ *
+ * 实现见 rtc_clock.cpp (固件独占编译; 模拟器不编此文件)。
+ *
+ * 说明: ESP32-C6 内置 RTC 域提供 64 位微秒基准, 由芯片 RTC 持续计时
+ *   (light/deep sleep 均不停摆), 系统 time()/settimeofday() 直接映射到该硬件 RTC,
+ *   返回真实 Unix 秒, 无 millis() 的 49 天回绕问题。
+ *   无备份电池: 整机完全掉电后 RTC 域清零, 故开机从 storage 的
+ *   g_pump_config.rtc_base_unix 恢复 (rtc_clock_init 时 settimeofday)。
+ *   后续若加 DS3231 等外置 RTC 或 SNTP, 只需替换 rtc_clock_init/rtc_unix_now 的实现。
+ *
+ * 时间基准 (rtc_base_unix) 与"显示/App 设置"统一存放于 g_pump_config, 因此本地 UI
+ * 与独立手机 App (自定义 BLE 设置通道) / Dana 0x71 SET_TIME 修改的是同一份数据, 互不冲突。
+ */
+#pragma once
+
+#include <cstdint>
+
+// 初始化: 从 g_pump_config.rtc_base_unix 载入基准, 并记录当前 millis()
+void rtc_clock_init(void);
+
+// 当前 Unix 秒; 返回 0 表示"未设置"
+uint32_t rtc_unix_now(void);
+
+// 是否已设置时间
+bool rtc_is_set(void);
+
+// 设置时间 (同时持久化到 storage)
+void rtc_set_unix(uint32_t unix_sec);
+
+// 日历 <-> Unix 互转 (UTC, 简化格里高利)
+//   声明为 inline, 使模拟器后端(ui_hal_sim.cpp)无需链接 rtc_clock.cpp 即可复用,
+//   保证固件与模拟器算法完全一致。
+static inline bool     rtc_is_leap_year(int y) { return ((y % 4 == 0) && (y % 100 != 0)) || (y % 400 == 0); }
+static inline int      rtc_days_in_month(int y, int mo)
+{
+    static const uint16_t dpm[12] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    if (mo == 2 && rtc_is_leap_year(y)) return 29;
+    if (mo >= 1 && mo <= 12) return dpm[mo - 1];
+    return 30;
+}
+static inline uint32_t rtc_ymdhms_to_unix(int y, int mo, int d, int h, int mi, int s)
+{
+    if (y < 1970) y = 1970;
+    if (mo < 1) mo = 1; if (mo > 12) mo = 12;
+    uint32_t days = 0;
+    for (int yy = 1970; yy < y; yy++) days += rtc_is_leap_year(yy) ? 366 : 365;
+    for (int mm = 1; mm < mo; mm++)  days += rtc_days_in_month(y, mm);
+    days += (uint32_t)(d > 0 ? d - 1 : 0);
+    return days * 86400UL + (uint32_t)h * 3600UL + (uint32_t)mi * 60UL + (uint32_t)s;
+}
+static inline void rtc_unix_to_ymdhms(uint32_t u, int *y, int *mo, int *d, int *h, int *mi, int *s)
+{
+    int year = 1970;
+    uint32_t days = u / 86400UL;
+    int sod = (int)(u % 86400UL);
+    while (days >= (rtc_is_leap_year(year) ? 366U : 365U)) {
+        days -= (rtc_is_leap_year(year) ? 366U : 365U); year++;
+    }
+    int month = 1;
+    while (days >= (uint32_t)rtc_days_in_month(year, month)) {
+        days -= (uint32_t)rtc_days_in_month(year, month); month++;
+    }
+    *y = year; *mo = month; *d = (int)days + 1;
+    *h = sod / 3600; *mi = (sod % 3600) / 60; *s = sod % 60;
+}

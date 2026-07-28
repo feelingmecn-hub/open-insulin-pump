@@ -21,11 +21,19 @@ void pump_state_set_alarm(alarm_code_t code);
 void pump_state_clear_alarm(void);
 void pump_state_set_state(pump_state_t s);
 
-// CRC-8 (CCITT) 实现
-uint8_t crc8_ccitt(const uint8_t *data, size_t len);
+// 消耗储药器药量 (带亚单位累加器, 避免 0.05U 反复丢失精度)
+void pump_state_consume_units(float units);
 
 // ============================================================
-// 单位(U) ↔ 微步 统一换算 (与固件端共用 dosing.h 单一真源, 由 config.h 引入)
-//   大剂量 / 基础率 / 排气 等所有「打药」路径都必须且只能经以下三函数,
-//   0.05U(U-100) = STEPS_PER_005U 自动由 dosing.h 推导。
+// 单位(U) ↔ 微步 统一换算  ← 全系统唯一换算入口
+//   换算算法与全部几何推导集中在 dosing.h (单一真源), 由 config.h 自动引入,
+//   不再于本文件重复声明/定义。大剂量 / 基础率 / 排气 等所有「打药」路径都必须
+//   且只能经 units_to_microsteps() / microsteps_to_units() / quantize_units_005()
+//   三函数, 严禁各模块自行用 STEPS_PER_UNIT 现算, 避免精度/取整不一致。
 // ============================================================
+
+// 给一份合理的内置默认基础率方案 (profile 0 = 0.5 U/h 全天)
+void pump_config_apply_default_basal(pump_config_t *cfg);
+
+// CRC-8 (CCITT) 实现
+uint8_t crc8_ccitt(const uint8_t *data, size_t len);

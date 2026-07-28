@@ -39,6 +39,11 @@ void pump_state_init(void)
     g_pump_config.motor_microstep       = MOTOR_MICROSTEPS;
     g_pump_config.units_per_ml          = INSULIN_CONCENTRATION;
 
+    // 显示 / 用户设置默认
+    g_pump_config.display_brightness = 40;   // 默认 40% (Waveshare 高温警告建议 ≤50)
+    g_pump_config.keypad_sound       = 1;    // 默认开
+    g_pump_config.rtc_base_unix      = 0;    // 未设置时钟
+
     // 内置默认基础率方案 (避免本地模式无方案导致 0 输注)
     pump_config_apply_default_basal(&g_pump_config);
 }

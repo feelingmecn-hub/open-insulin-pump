@@ -36,7 +36,7 @@ enum {
     SCR_PRIME,
     SCR_ALARM_LIST, SCR_ALARM_DETAIL,
     SCR_LOOP,
-    SCR_SETTINGS
+    SCR_SETTINGS, SCR_CLOCK_SET, SCR_ABOUT
 };
 
 // ---- 全局导航状态 ----
@@ -56,14 +56,30 @@ static int   s_meal_sel  = 0;          // 三餐预设选中
 // 基础率模式由 ui_hal_basal_local_mode() 实时反映, 不在此缓存
 static int   s_alarm_sel   = 0;
 
+// 时钟设置页编辑状态
+static int  s_clk_field = 0;          // 0=年 1=月 2=日 3=时 4=分 5=保存
+static int  s_clk_y = 2026, s_clk_mo = 1, s_clk_d = 1, s_clk_h = 0, s_clk_mi = 0;
+
 // ---- 文本映射 ----
 static const char *trend_str(int8_t t)
 {
-    switch (t) { case 1: return "上升 ↑"; case -1: return "下降 ↓"; default: return "平稳 →"; }
+    switch (t) {
+        case 2:  return "速升 ↑↑";
+        case 1:  return "缓升 ↗";
+        case -1: return "缓降 ↘";
+        case -2: return "速降 ↓↓";
+        default: return "平稳 →";
+    }
 }
 static lv_color_t trend_color(int8_t t)
 {
-    switch (t) { case 1: return RED; case -1: return GREEN; default: return DIM; }
+    switch (t) {
+        case 2:  return RED;     // 快速上升 (警示)
+        case 1:  return YELLOW;  // 缓升
+        case -1: return GREEN;   // 缓降
+        case -2: return GREEN;   // 速降
+        default: return DIM;     // 平稳
+    }
 }
 static const char *loop_str(uint8_t m)
 {
@@ -152,7 +168,9 @@ static void draw_home(void)
     lv_obj_set_style_pad_all(hdr, 0, 0);
     lv_obj_set_style_radius(hdr, 0, 0);
 
-    snprintf(buf, sizeof buf, "%02d:%02d", hh, mm);
+    // 时钟: 未设置显示 "--:--"
+    if (hh < 0) snprintf(buf, sizeof buf, "--:--");
+    else        snprintf(buf, sizeof buf, "%02d:%02d", hh, mm);
     L(4, 2, buf, FONT_SM, lv_color_white());                     // 时钟 (白)
     L(112, 1, "闭环胰岛素泵", FONT_MAIN, lv_color_white());      // 标题 (白)
     snprintf(buf, sizeof buf, "电池 %d%%", g_pump_state.battery_pct);
@@ -160,10 +178,20 @@ static void draw_home(void)
 
     // ---- 左栏: CGM ----
     L(4, 22, "血糖 (CGM)", FONT_SM, DIM);
-    snprintf(buf, sizeof buf, "%.1f", ui_hal_glucose_mmol());
-    L(4, 40, buf, FONT_MAIN, TITLE);                             // 血糖大字
+    float gm = ui_hal_glucose_mmol();
+    bool gvalid = ui_hal_glucose_valid();
+    if (!gvalid) {
+        L(4, 40, "CGM 离线", FONT_MAIN, DIM);                   // 无数据 / 过期 >10min
+    } else {
+        snprintf(buf, sizeof buf, "%.1f", gm);
+        L(4, 40, buf, FONT_MAIN, TITLE);                        // 血糖大字 (mmol/L)
+    }
     L(70, 46, "mmol/L", FONT_SM, DIM);
-    L(4, 66, trend_str(ui_hal_glucose_trend()), FONT_SM, trend_color(ui_hal_glucose_trend()));
+    if (!gvalid) {
+        L(4, 66, "--", FONT_SM, DIM);
+    } else {
+        L(4, 66, trend_str(ui_hal_glucose_trend()), FONT_SM, trend_color(ui_hal_glucose_trend()));
+    }
     snprintf(buf, sizeof buf, "闭环: %s", loop_str(ui_hal_loop_mode()));
     L(4, 90, buf, FONT_SM, loop_color(ui_hal_loop_mode()));
 
@@ -370,9 +398,19 @@ static void draw_loop(void)
     L(12, 26, "AAPS:", FONT_SM, DIM);
     L(80, 26, ui_hal_loop_connected() ? "已连接" : "断开", FONT_SM,
       ui_hal_loop_connected() ? GREEN : RED);
-    snprintf(buf, sizeof buf, "血糖: %.1f mmol/L", ui_hal_glucose_mmol());
+    // 区分"已连接"与"AAPS 完成 Dana 握手接管"
+    const char *pair = ui_hal_dana_paired() ? "已接管" : (ui_hal_loop_connected() ? "未接管" : "—");
+    lv_color_t pc = ui_hal_dana_paired() ? GREEN : (ui_hal_loop_connected() ? YELLOW : DIM);
+    L(12, 44, "接管:", FONT_SM, DIM);
+    L(80, 44, pair, FONT_SM, pc);
+    if (ui_hal_glucose_valid()) {
+        snprintf(buf, sizeof buf, "血糖: %.1f mmol/L", ui_hal_glucose_mmol());
+    } else {
+        snprintf(buf, sizeof buf, "血糖: CGM 离线");
+    }
     L(12, 50, buf, FONT_SM, TEXT);
-    L(12, 72, trend_str(ui_hal_glucose_trend()), FONT_SM, trend_color(ui_hal_glucose_trend()));
+    L(12, 72, ui_hal_glucose_valid() ? trend_str(ui_hal_glucose_trend()) : "--",
+      FONT_SM, ui_hal_glucose_valid() ? trend_color(ui_hal_glucose_trend()) : DIM);
     snprintf(buf, sizeof buf, "模式: %s", loop_str(ui_hal_loop_mode()));
     L(12, 94, buf, FONT_SM, loop_color(ui_hal_loop_mode()));
     float tbr = ui_hal_tbr_percent();
@@ -389,7 +427,11 @@ static void draw_settings(void)
 {
     title("系统设置");
     const char *names[4] = { "日期时间", "屏幕亮度", "按键音", "关于" };
-    static const char *vals[4] = { "→", "50%", "开", "→" };
+    char vals[4][16];
+    snprintf(vals[0], sizeof vals[0], "%s", ui_hal_clock_valid() ? "已设置" : "未设置");
+    snprintf(vals[1], sizeof vals[1], "%d%%", ui_hal_get_brightness());
+    snprintf(vals[2], sizeof vals[2], "%s", ui_hal_get_keypad_sound() ? "开" : "关");
+    strcpy(vals[3], "→");
     for (int i = 0; i < 4; i++) {
         int y = 32 + i * 22;
         bool sel = (i == s_sel);
@@ -398,6 +440,32 @@ static void draw_settings(void)
         L(16, y, line, FONT_MAIN, sel ? ACCENT : TEXT);
         L(220, y, vals[i], FONT_MAIN, sel ? ACCENT : DIM);
     }
+    L(100, 134, "上下选/调亮度  确认进入  返回", FONT_SM, DIM);
+}
+
+static void draw_clock_set(void)
+{
+    title("设置时间");
+    const char *labels[6] = { "年", "月", "日", "时", "分", "保存" };
+    int vals[5] = { s_clk_y, s_clk_mo, s_clk_d, s_clk_h, s_clk_mi };
+    char buf[16];
+    for (int i = 0; i < 6; i++) {
+        int y = 24 + i * 17;
+        bool sel = (i == s_clk_field);
+        if (i < 5) snprintf(buf, sizeof buf, "%s %02d", labels[i], vals[i]);
+        else       snprintf(buf, sizeof buf, "%s %s", labels[i], "✔ 保存并返回");
+        L(40, y, buf, FONT_MAIN, sel ? ACCENT : TEXT);
+    }
+    L(100, 134, "上下调整  确认下一项  返回取消", FONT_SM, DIM);
+}
+
+static void draw_about(void)
+{
+    title("关于");
+    L(12, 26, "OpenLoop 闭环胰岛素泵", FONT_MAIN, TITLE);
+    L(12, 50, "理论验证 / 教学原型", FONT_SM, DIM);
+    L(12, 74, "硬件: ESP32-C6 + DRV8825", FONT_SM, TEXT);
+    L(12, 96, "⚠ 严禁用于人体", FONT_SM, RED);
     L(100, 134, "返回", FONT_SM, DIM);
 }
 
@@ -421,6 +489,8 @@ static void draw_current(void)
         case SCR_ALARM_DETAIL: draw_alarm_detail(); break;
         case SCR_LOOP:         draw_loop(); break;
         case SCR_SETTINGS:     draw_settings(); break;
+        case SCR_CLOCK_SET:    draw_clock_set(); break;
+        case SCR_ABOUT:        draw_about(); break;
         default:               draw_home(); break;
     }
 }
@@ -570,12 +640,49 @@ static void handle_key(key_event_t k)
             break;
 
         case SCR_SETTINGS:
-            if (k == KEY_UP)        s_sel = (s_sel + 3) % 4;
-            else if (k == KEY_DOWN) s_sel = (s_sel + 1) % 4;
-            else if (k == KEY_ESC)  back_to(SCR_MENU);
-            // 确认: 亮度/按键音 仅演示切换, 不进子页
-            else if (k == KEY_SET && s_sel == 1) ui_hal_set_brightness(50);   // 亮度演示
-            else if (k == KEY_SET && s_sel == 2) ui_hal_toggle_keypad_sound(); // 按键音
+            if (k == KEY_SET && s_sel == 0) {
+                int s; ui_hal_get_ymdhms(&s_clk_y, &s_clk_mo, &s_clk_d,
+                                         &s_clk_h, &s_clk_mi, &s);
+                s_clk_field = 0;
+                enter_child(SCR_CLOCK_SET);
+            } else if (k == KEY_SET && s_sel == 2) {
+                ui_hal_toggle_keypad_sound();
+            } else if (k == KEY_SET && s_sel == 3) {
+                enter_child(SCR_ABOUT);
+            } else if (k == KEY_ESC) {
+                back_to(SCR_MENU);
+            } else if (k == KEY_UP) {
+                if (s_sel == 1) { uint8_t b = ui_hal_get_brightness();
+                                  if (b <= 95) ui_hal_set_brightness((uint8_t)(b + 5)); }
+                else s_sel = (s_sel + 3) % 4;
+            } else if (k == KEY_DOWN) {
+                if (s_sel == 1) { uint8_t b = ui_hal_get_brightness();
+                                  if (b >= 5) ui_hal_set_brightness((uint8_t)(b - 5)); }
+                else s_sel = (s_sel + 1) % 4;
+            }
+            break;
+
+        case SCR_CLOCK_SET:
+            if (k == KEY_ESC) { back_to(SCR_SETTINGS); break; }
+            if (k == KEY_SET) {
+                if (s_clk_field < 5) s_clk_field++;        // 下一项
+                else {                                     // field 5 = 保存
+                    ui_hal_set_time_ymdhms(s_clk_y, s_clk_mo, s_clk_d,
+                                          s_clk_h, s_clk_mi, 0);
+                    back_to(SCR_SETTINGS);
+                }
+                break;
+            }
+            // 上下调整当前字段
+            if (s_clk_field == 0)      s_clk_y  = (k==KEY_UP) ? (s_clk_y<2099?s_clk_y+1:2099) : (s_clk_y>2020?s_clk_y-1:2020);
+            else if (s_clk_field == 1) s_clk_mo = (k==KEY_UP) ? (s_clk_mo%12)+1 : (s_clk_mo==1?12:s_clk_mo-1);
+            else if (s_clk_field == 2) s_clk_d  = (k==KEY_UP) ? (s_clk_d%31)+1 : (s_clk_d==1?31:s_clk_d-1);
+            else if (s_clk_field == 3) s_clk_h  = (k==KEY_UP) ? (s_clk_h+1)%24 : (s_clk_h+23)%24;
+            else if (s_clk_field == 4) s_clk_mi = (k==KEY_UP) ? (s_clk_mi+1)%60 : (s_clk_mi+59)%60;
+            break;
+
+        case SCR_ABOUT:
+            if (k == KEY_SET || k == KEY_ESC) back_to(SCR_SETTINGS);
             break;
 
         default: break;

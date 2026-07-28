@@ -4,6 +4,28 @@
 
 ---
 
+## 2026-07-28 — AAPS 闭环联调同步演示（四宫格 GUI + 一键启动器）
+
+> 为向他人无硬件演示「AAPS 发令 → 固件收令 → 电机推药 → 泵屏响应」完整闭环，新增桌面联调同步演示。
+
+- **架构（统一进模拟器）**：把真实固件命令核心（`aaps_dana` + `dosing.h` 单一真源 + `basal_scheduler`）编进 LVGL 模拟器（`SIM_LINK_MODE`），由 `link_session` 脚本化 17 步会话引擎驱动 `g_pump_state`，泵屏幕每帧重绘即与 AAPS 命令严格同步；TCP 控制通道 `127.0.0.1:18923`（`link_ipc`）向 Python 控制面板广播状态 JSON 并接收 play/pause/step/reset/delay 指令。
+- **四宫格控制面板 `test/link_demo_gui.py`**（Tkinter，无外部依赖）：① 步进电机推药动画（转子随微步旋转 + 丝杠 + 注射器柱塞随发药推进，数据来自固件 `motor_delivered_units_x100()`）；② AAPS 发送调试窗（真实 `dana_build_packet` 在途字节 + opcode 名 + 意图）；③ 固件接收调试窗（真实 `aaps_dana_feed_rx_test` 解包 / 分发动作 / 回应字节，篡改 CRC 红显「被拒绝」）；④ 泵屏 UI 实时复刻（canvas 320×172）。协议轨迹缓冲 `LinkTrace` 同时喂②③两窗。
+- **一键启动器 `test/run_link_demo.command` / `run_link_demo.sh`**：双击即全自动构建联调版 → 启模拟器（弹泵屏窗口）→ 启控制面板；以构建模式标记 `.built_link_mode` 判断，确保跑的是联调版（避免切回 mock 后演示失效）；关闭窗口自动清理进程。配套 `build_sim_link.sh` / `build_sim_mock.sh` 与 `link_mode_smoke.cpp`（纯逻辑冒烟）。
+- **验证**：端到端（后台启模拟器 + 客户端驱动）17/17 步、50 检查 0 失败；协议轨迹 18 条（含 1 条篡改被拒）；末态 `motor_units=2.00 / microsteps=4356`（2U×2178）；首条 TX `A5 A5 02 D2 FF 9A 4A 5A 5A` 为真实在途字节。mock 模式回归构建无破坏。
+
+---
+
+## 2026-07-28 — AAPS Dana-i impersonation 协议实现（字节级 205 场景验证）
+
+- **新增 `code/esp32_firmware/src/aaps_dana.{h,cpp}`**：纯逻辑（无 NimBLE 依赖，可被宿主编译）的 Dana-i BLE 协议模块；`config.h` 宏 `USE_AAPS_DANA`（默认关闭）；`ble_comm.cpp` 双模挂载 `FFF0/FFF1/FFF2`。命令分发到 `motor_enqueue` / `motor_cancel_bolus` / `basal_scheduler_*`（经 `dosing.h` 单一换算），不动既有电机逻辑。
+- **协议细节（逐行对齐 AndroidAPS `pump/danars` 的 `BleEncryption.kt` + `DanaRSPacket*`）**：GATT `FFF0/FFF1/FFF2` + CCCD `2902`；信封 `A5 A5 len TYPE OPCODE params CRC16 5A 5A`；单字节 opcode（`0x4A` 步进大剂量 / `0xC1` APS-TBR / `0x47` 方波 / `0x62` 停 TBR / `0x49` 停方波 / `0x02` 状态 / `0x48` CGM / `0x70`/`0x71` 时间同步…）；设备名须正好 10 字符 `^[a-zA-Z]{3}[0-9]{5}[a-zA-Z]{2}$`。
+- **关键纠正（与旧文档 §3 不同）**：① 一级信封 XOR 混淆区间**含 CRC_L**（`buf[3..size-3]`）；② 握手包（PUMP_CHECK / TIME_INFORMATION，双向）**不做二级加密**——AAPS 仅在 `isConnected==true` 才二级解密，握手期 `connectionState=0/1`；设备端镜像：收完 TIME_INFORMATION 置 `HANDSHAKE_DONE` 后命令包才二级加密。
+- **字节级验证**：`test/aaps_dana_test.cpp`（g++ 纯逻辑）+ `test/oracle_aaps.py`（AAPS `BleEncryption.kt` 逐字转译预言机）→ `test/run_tests.sh` 抽取 `^PKT ` 行排序 diff，**205 个场景全部字节级匹配**（握手包 + 命令响应 + 通知 + 200 随机命令包）。
+- **配套新增**：`iob_model.{h,cpp}`（Walsh 三角衰减，替代旧双指数）、`rtc_clock.{h,cpp}`（ESP32 硬件 RTC，无 49 天回绕）、`docs/12-AAPS-Dana协议与对接方案.md`（权威协议文档）。
+- ⚠️ 0x48/0x71 字节布局按标准 DanaRS 文档推算，**未抓到用户 AAPS 版本源码**，须真机联调 `adb logcat | grep -i dana` + 抓包核对；不符仅改 `dana_apply_glucose` / `dana_apply_time` 映射。
+
+---
+
 ## 2026-07-28（方波/双波）— 延展量改为连续慢滴（贴近真实泵，非几分钟一跳）
 
 - **问题**：上一版方波/双波延展量挂在 3 分钟基础率节拍上、用大剂量快速度(`BOLUS_SPEED_HZ`)

@@ -46,6 +46,8 @@ void setup()
     pump_state_init();
     storage_init();
     storage_load_config(&g_pump_config);
+    rtc_clock_init();            // 载入持久化时钟基准 (须在 storage_load_config 之后)
+    iob_init();                  // IOB 衰减模型记录表清零
     history_log_init();          // 恢复持久化历史事件
 
     ina226_init();

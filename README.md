@@ -41,12 +41,12 @@
 | 降压 | DC-DC 11.1V→5V（系统供电）+ AMS1117-3.3（DRV8825 VDD） |
 | 监测 | INA226 电流/电压采集（电机丢步/堵转/原点监护） |
 | 注射精度 | **0.05U（0.5µL U-100 胰岛素）**（理论目标，未标定） |
-| 通信 | BLE 5.0 GATT（直连 AAPS）+ Wi-Fi（OTA/调试） |
+| 通信 | BLE 5.0 GATT：AAPS **Dana-i impersonation**（方案 B，GATT `FFF0/FFF1/FFF2` + 自定义 Dana CRC + 两级加密）；Wi-Fi（OTA/调试） |
 | 显示 | 1.47" LCD（ST7789，板载，172×320 横屏逻辑 320×172） |
 | 操控 | 手机 APP（AAPS 插件 + 自研 APP）+ 4 键按键板 |
 | 储药器 | 标准 3mL 注射器型储药器（丹纳PH300 / 优泵CY-13 兼容，300U） |
 
-> **Rev.2 硬件改版说明**：相对初版（Rev.1 / ESP32-C3 + 2S + MT3608 升压 + OLED）的主要变更——ESP32-C3 → ESP32-C6 1.47" LCD 开发板；2S 7.4V → 3S 11.1V（SM20 接口，入口 104 + 100µF/16V 滤波）；MT3608 升压 12V → DC-DC 降压 11.1V→5V；新增 INA226 电流/电压监测与 4 键按键板；电机由 12V 升压供电改为 11.1V 直供。DRV8825 保持不变。
+> **硬件平台（已确定）**：主控统一采用 **ESP32-C6 1.47" LCD 开发板**（RISC-V 内核，WiFi6+BLE5，板载 ST7789 屏）；电池 3S 11.1V（SM20 接口，入口 104 + 100µF/16V 滤波）；供电 DC-DC 降压 11.1V→5V；含 INA226 电流/电压监测与 4 键按键板；电机 11.1V 直供。DRV8825 保持不变。注：早期 Rev.1 曾评估 ESP32-C3 方案，现已**完全放弃，统一采用 ESP32-C6**。
 >
 > ⚠️ **硬件仍为「设计/打样阶段」，未做成可穿戴给药终端**。PCB、机械外壳、BOM 均为理论设计，请按 `docs/` 中说明自行评估风险。
 
@@ -79,6 +79,14 @@
 ### FreeRTOS 任务划分（固件）
 `safety_task`（最高）· `motor_task` · `ble_task` · `battery_task` · `keypad_task` · `display_task` · `basal_scheduler_task`（新增）· 其余辅助任务。
 
+### AAPS 闭环对接（Dana-i impersonation，方案 B）
+固件通过 `aaps_dana.{h,cpp}` 模块 **impersonate 一台 Dana-i 胰岛素泵**，让已安装的 AndroidAPS 直接连上本设备、下发基础率 / 大剂量 / 方波 / TBR / 时间同步 / CGM，无需任何自定义 APP 或驱动补丁。
+- **协议权威来源** = AndroidAPS `pump/danars` 模块（`BleEncryption.kt` + `DanaRSPacket*`），逐行确认后实现。
+- **传输规格**：GATT `FFF0`(write) / `FFF1`(notify) / `FFF2`(write-no-response) + CCCD `2902`；信封 `A5 A5 len TYPE OPCODE params CRC16 5A 5A`；单字节 opcode 体系（`0x4A` 步进大剂量 / `0xC1` APS-TBR / `0x47` 方波 / `0x62` 停 TBR / `0x48` CGM / `0x02` 状态…）；设备名须正好 10 字符，匹配 `^[a-zA-Z]{3}[0-9]{5}[a-zA-Z]{2}$`。
+- **安全**：一级信封 XOR 混淆（含 CRC_L）+ 二级 BLE_5 确定性字节混淆；握手（PUMP_CHECK / TIME_INFORMATION）期不做二级加密，握手完成后才启用。
+- **字节级验证**：`test/aaps_dana_test.cpp`（g++ 纯逻辑）+ `test/oracle_aaps.py`（AAPS 源码转译预言机）→ `test/run_tests.sh` 抽取 `^PKT ` 行排序 diff，**205 个场景全部字节级匹配**（握手 / 命令响应 / 通知 / 200 随机命令包）。
+- **真机实测待做**：需以 `config.h` 开 `USE_AAPS_DANA` + Arduino IDE 烧录 + 真实 AndroidAPS 配对（**仅空注射器 / 水**，严禁人体）。
+
 ---
 
 ## 3. UI 界面（模拟器预览）
@@ -101,6 +109,41 @@
 
 ---
 
+## 3.1 AAPS 闭环联调同步演示（桌面，无需硬件）
+
+把**真实固件命令核心**（`aaps_dana` + 剂量换算 + 调度器）编进 PC 模拟器，由脚本化的 17 步会话引擎驱动 `g_pump_state`，**泵屏幕每帧重绘即与 AAPS 命令严格同步**；另配一个 Python 控制面板做四路同步可视化，便于无硬件环境下向他人演示「AAPS 发令 → 固件收令 → 电机推药 → 泵屏响应」的完整闭环。
+
+### 四路同步画面（控制面板 `test/link_demo_gui.py`）
+| 面板 | 内容 | 数据来源（真实，非编造） |
+|------|------|--------------------------|
+| ① 步进电机推药 | canvas 画步进电机（转子随微步旋转）+ 丝杠 + 注射器柱塞随发药推进，标「已发药 X.XX U / 微步 N / 柱塞行程 mm」 | 固件 `motor_delivered_units_x100()` → `dosing.h` 单一真源换算 |
+| ② AAPS 发送调试窗 | 每次 AAPS 经 BLE 发出的**原始在途字节** + opcode 名 + 人类意图（如「大剂量 2.00U」） | `dana_build_packet` 真实打包 |
+| ③ 固件接收调试窗 | 固件解包（CRC / 类型）+ 实际分发动作（如 `motor_enqueue`）+ 回应原始字节；**篡改 CRC 的命令红显「被拒绝」** | `aaps_dana_feed_rx_test` 真实解包分发 |
+| ④ 胰岛素泵屏幕 UI | canvas 复刻 320×172 横屏状态屏，随状态实时变化（也可直接看 SDL 真实窗口） | `g_pump_state` 每帧重绘 |
+
+> ②③ 两窗的字节与动作是**真实的 Dana-i 协议**，不是模拟的——`link_session` 的发送函数真走 `dana_build_packet` 打包 + 固件 `aaps_dana_feed_rx_test` 解包分发，协议轨迹缓冲把每次收发抓下来同时喂给两窗。
+
+### 一键启动（推荐）
+```bash
+# macOS 双击此文件即可全自动：构建联调版 → 启模拟器(弹泵屏窗口) → 启控制面板
+open test/run_link_demo.command
+# 或命令行
+bash test/run_link_demo.sh
+```
+控制面板点 ▶ 播放即看四路同步演示。脚本会自动确保运行的是「联调版」二进制（通过构建模式标记 `.built_link_mode` 判断，避免切回 mock 后演示失效），关闭窗口时自动清理进程。
+
+### 手动构建（可选）
+```bash
+bash test/build_sim_link.sh     # 构建联调版 (SIM_LINK_MODE=ON)，二进制在 /Users/feelingme/pump_sim_build/simulator
+bash test/build_sim_mock.sh     # 切回普通 mock 模拟器
+SIM_HEADLESS=1 /Users/feelingme/pump_sim_build/simulator &   # 无窗口模式(沙箱/无显示器)
+python3 test/link_demo_gui.py                                # 连控制面板
+```
+- 验证（后台启模拟器 + 客户端驱动）：17/17 步、50 检查 0 失败；协议轨迹 18 条（含 1 条篡改被拒）；末态 `motor_units=2.00 / microsteps=4356`（2U×2178）。
+- 纯逻辑冒烟另见 `test/link_mode_smoke.cpp`（不依赖 LVGL/SDL）。
+
+---
+
 ## 4. 项目目录结构
 
 ```
@@ -110,7 +153,7 @@
 ├── LICENSE                   ← 软件许可证（MIT + 免责）
 ├── LICENSE-HARDWARE          ← 硬件许可证（CERN-OHL-S + 免责）
 ├── NOTICE                    ← 安全 / 免责重点提示
-├── docs/                     ← 技术文档（11 篇 + UI 设计）
+├── docs/                     ← 技术文档（14 篇：系统/电源/电机/PCB/固件/AAPS/Android/机械/安全/测试/BOM/12-AAPS-Dana 协议/12-接线 + UI 设计）
 ├── code/
 │   ├── esp32_firmware/       ← ESP32-C6 固件（Arduino 框架，Rev.2）
 │   │   ├── esp32_firmware.ino     ← 主入口（setup/loop + FreeRTOS 任务）
@@ -119,21 +162,26 @@
 │   │   │   ├── ui_screen.{h,cpp}  ← 共用界面（白底中文，320×172）
 │   │   │   ├── ui_hal.h           ← UI 硬件抽象接口
 │   │   │   ├── ui_hal_fw.cpp      ← 固件后端（接真实模块）
-│   │   │   ├── basal_scheduler.{h,cpp} ← 基础率周期调度器（新增）
+│   │   │   ├── aaps_dana.{h,cpp}  ← AAPS Dana-i impersonation BLE 模块（方案 B）
+│   │   │   ├── iob_model.{h,cpp}  ← IOB 模型（Walsh 三角衰减）
+│   │   │   ├── rtc_clock.{h,cpp}  ← ESP32 硬件 RTC（无 49 天回绕）
+│   │   │   ├── basal_scheduler.{h,cpp} ← 基础率周期调度器
 │   │   │   ├── lv_font_cn_16.cpp / lv_font_cn_12.cpp ← bpp=4 中文字体
 │   │   │   ├── pump_types.h / pump_state.{h,cpp} ← 状态机/CRC
 │   │   │   ├── motor_controller.* / ina226.* / lcd_display.*
 │   │   │   ├── keypad.* / battery_monitor.* / safety_monitor.*
 │   │   │   ├── ble_comm.* / storage.* / history_log.*
 │   │   │   └── power_manager.*
-│   │   └── test/
+│   │   └── test/                 ← 宿主单元测试（aaps_dana 字节级验证 / 联调冒烟）
 │   └── android_app/          ← Android APP（Kotlin + Compose）
 ├── simulator/
 │   └── lvgl_sdl/             ← PC 模拟器（SDL2 + LVGL 9.5.0）
 │       ├── README.md
-│       ├── CMakeLists.txt
-│       ├── src/              ← ui_screen/ui_hal/mock_hal/pump_state…（与固件同步）
-│       └── preview/          ← 9 页 UI 截图（见上）
+│       ├── CMakeLists.txt    ← 含 SIM_LINK_MODE 选项（联调同步演示）
+│       ├── src/              ← ui_screen/ui_hal/mock_hal/pump_state…
+│       │                     ←   + link_session/link_ipc/ui_hal_link（联调引擎）
+│       └── preview/          ← 11 页 UI 截图（见上）
+├── test/                     ← AAPS 联调同步演示（link_demo_gui.py / run_link_demo.* / build_sim_*.sh / aaps_link_sim.cpp / host/）
 ├── pcb/                      ← PCB 原理图 / 布局 / Gerber
 ├── mechanical/               ← 机械 CAD / 3D 打印 / 图纸
 ├── diagrams/                 ← 系统框图
@@ -213,6 +261,9 @@ cmake --build build -j
 ### 6.4 Android APP
 Kotlin + Jetpack Compose，44 个源文件，5 个 Compose 屏幕。BLE 协议与固件二进制 + CRC-8/CCITT 对齐，UUID 基础 `6E400001-B5A3-F393-E0A9-E50E24DCCA9E`。详见 [`docs/07-android-app.md`](docs/07-android-app.md)。
 
+### 6.5 AAPS 闭环联调同步演示（桌面，无需硬件）
+见上文 §3.1。一句话：`open test/run_link_demo.command`（macOS 双击）即全自动构建联调版模拟器、弹出泵屏窗口并启动四路同步控制面板；点 ▶ 播放看「① 电机推药 ② AAPS 发送 ③ 固件接收 ④ 泵屏 UI」实时联动。教学演示用，**严禁用于人体**。
+
 ---
 
 ## 7. 开发路线图
@@ -220,13 +271,13 @@ Kotlin + Jetpack Compose，44 个源文件，5 个 Compose 屏幕。BLE 协议�
 | 阶段 | 内容 | 状态 |
 |------|------|------|
 | Phase 0 | 方案设计与文档 | ✅ 完成 |
-| Phase 1 | 固件 / 模拟器代码（含 ui_hal 抽象、基础率调度、BLE CRC 协议） | ✅ 完成（理论代码） |
+| Phase 1 | 固件 / 模拟器代码（含 ui_hal 抽象、基础率调度、BLE CRC 协议、AAPS Dana-i impersonation） | ✅ 完成（理论代码） |
 | Phase 2 | 元件采购 + 面包板原型 | ⏳ 待启动 |
 | Phase 3 | 电机单步精度验证（0.05U，需计量标定） | ⏳ 待启动 |
 | Phase 4 | ESP32-C6 + DRV8825 联动测试 | ⏳ 待启动 |
 | Phase 5 | BLE 通信 + Android APP 联调 | ⏳ 待启动 |
 | Phase 6 | PCB 设计 + 3D 打印外壳 | ⏳ 待启动 |
-| Phase 7 | AAPS 集成（自定义驱动） | ⏳ 待启动 |
+| Phase 7 | AAPS 集成（Dana-i impersonation + 桌面联调同步演示验证） | ✅ 字节级 205 场景匹配 + 四宫格同步演示（真机实测 ⏳ 待启动） |
 | Phase 8 | 安全验证 + 长期稳定性 | ⏳ 待启动（**最关键，未做不得人体使用**） |
 
 ---
