@@ -99,3 +99,11 @@ static inline void rtc_unix_to_ymdhms(uint32_t u, int *y, int *mo, int *d, int *
     *y = year; *mo = month; *d = (int)days + 1;
     *h = sod / 3600; *mi = (sod % 3600) / 60; *s = sod % 60;
 }
+
+// ---- 时区 (小时, 有符号; 默认东八区) ----
+// 内部系统时钟 (rtc_unix_now / g_pump_config.rtc_base_unix) 一律存**真实 UTC 秒**。
+// 显示给用户、用户输入、以及 Dana 0x78 回给 AAPS 的墙钟, 都是"本地墙钟 = UTC + offset*3600"。
+// 这样与 AAPS 的协议自洽: AAPS 的 0x79 发送端用 UTC 构造, 0x78 接收端用手机本地时区解释泵回的墙钟。
+void     rtc_set_zone_offset(int8_t zh);
+int8_t   rtc_get_zone_offset(void);
+uint32_t rtc_local_now(void);   // 本地墙钟秒 = rtc_unix_now() + offset*3600 (未设置时返回 0)

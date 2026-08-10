@@ -532,7 +532,6 @@ static void dana_apply_time(const uint8_t *p, size_t n)
  *    编译时间（__DATE__/__TIME__，即本机构建时的北京时间）。用户只要在
  *    烧录后不久连接就能落进 1.5h 窗口，之后 AAPS 会用 0x79 精确校时。
  * ============================================================ */
-static int8_t g_dana_zone_offset = 8;   /* 东八区默认；收到 0x79 后由手机覆盖 */
 
 /* 固件编译时刻（本地墙钟）→ unix 秒，作为 RTC 未设置时的兜底 */
 /* 泵内本地墙钟（unix 秒），RTC 未设置时回退到固件编译时刻。
@@ -727,34 +726,38 @@ int aaps_dana_handle_command(dana_ctx_t *c, uint8_t opcode,
         }
 
         /* ---- 0x78 OPTION__GET_PUMP_UTC_AND_TIME_ZONE → 7B ----
-         * AAPS: DateTime(2000+y, m, d, h, mi, s) 用**手机本地时区**解释，
-         *       再 setPumpTime(millis, zoneOffset) 加回 offset → 得到真实 UTC。
-         * ⇒ 这里必须回 **UTC 墙钟**，而不是本地墙钟。
-         * ⚠️ month/day 为 0 会让 Joda DateTime 抛 IllegalFieldValueException，
-         *    进而 setReceived() 不执行 → 5 秒超时断开。dana_local_now() 保证有效。 */
+         * AAPS 接收端 (GetPumpUTCAndTimeZone.kt:29) 用 Joda DateTime(2000+y, m, d, h, mi, s)
+         * **以手机本地时区**解释泵回的墙钟得到 value(毫秒), 再 DanaPump.setPumpTime
+         * (kt:79-85) 把 value 加回**手机本地 offset** 得到 pumpTime。
+         * ⇒ 这里必须回 **纯 UTC 墙钟**(= 系统时钟本身), 不要减也不要加 offset。
+         *   例: 系统时钟 08:12 UTC → 回 08:12 + offset(8); AAPS 用北京解释 08:12 → 00:12 UTC,
+         *       再加 8h → 08:12 UTC = 手机 System.currentTimeMillis → timeDiff≈0。
+         *   (若此处回本地墙钟 16:12, AAPS 解释 16:12→08:12 UTC, 再加 8h→16:12 UTC, 反而差 +8h。)
+         * ⚠️ month/day 为 0 会让 Joda DateTime 抛 IllegalFieldValueException,
+         *    进而 setReceived() 不执行 → 5 秒超时断开。dana_local_now() 带兜底保证有效。 */
         case DANA_CMD_GET_UTC_TZ: {
-            int32_t  off_s = (int32_t)g_dana_zone_offset * 3600;
-            uint32_t utc   = dana_local_now();
-            utc = (off_s >= 0 || utc > (uint32_t)(-off_s)) ? (uint32_t)((int32_t)utc - off_s) : 0;
+            uint32_t utc = dana_local_now();   // 纯 UTC 秒(未设置时兜底编译时刻)
             int y, mo, d, h, mi, s;
             rtc_unix_to_ymdhms(utc, &y, &mo, &d, &h, &mi, &s);
             resp[0] = (uint8_t)(y - 2000);
             resp[1] = (uint8_t)mo; resp[2] = (uint8_t)d;
             resp[3] = (uint8_t)h;  resp[4] = (uint8_t)mi; resp[5] = (uint8_t)s;
-            resp[6] = (uint8_t)(int8_t)g_dana_zone_offset;   // 有符号小时
+            resp[6] = (uint8_t)(int8_t)rtc_get_zone_offset();   // 有符号小时
             rn = 7;
             break;
         }
 
-        /* ---- 0x79 OPTION__SET_PUMP_UTC_AND_TIME_ZONE ← 7B（UTC + 时区）----
-         * 泵内 RTC 存本地墙钟 = UTC + offset*3600。响应 1B result。 */
+        /* ---- 0x79 OPTION__SET_PUMP_UTC_AND_TIME_ZONE ← 7B（真实 UTC + 时区）----
+         * AAPS 发送端 (SetPumpUTCAndTimeZone.kt:23) 用 DateTime(time).withZone(UTC) 构造,
+         * 故 params[0..5] 已是**真实 UTC** 年月日时分秒。泵内 RTC 也一律存真实 UTC 秒,
+         * 不要再叠加 offset (offset 只用于显示/0x78 回本地墙钟)。响应 1B result。 */
         case DANA_CMD_SET_UTC_TZ: {
             if (nparams >= 7) {
                 uint32_t utc = rtc_ymdhms_to_unix((int)params[0] + 2000, (int)params[1], (int)params[2],
                                                   (int)params[3], (int)params[4], (int)params[5]);
                 int8_t off = (int8_t)params[6];
-                g_dana_zone_offset = off;
-                if (utc != 0) rtc_set_unix((uint32_t)((int32_t)utc + (int32_t)off * 3600));
+                rtc_set_zone_offset(off);                 // 记住手机时区
+                if (utc != 0) rtc_set_unix(utc);          // 直接存真实 UTC, 不叠加 offset
             }
             resp[0] = 0x00;
             rn = 1;

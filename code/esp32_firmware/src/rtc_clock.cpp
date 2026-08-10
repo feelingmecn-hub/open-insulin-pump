@@ -31,6 +31,7 @@
 
 // ---- 内部状态 ----
 static bool s_set = false;   // 是否已设置过有效时间 (硬件 RTC 已写入基准)
+static int8_t s_zone_offset = 8;   // 时区偏移(小时, 有符号); 默认东八区
 
 // 将系统时钟 (硬件 RTC 域) 设为指定 Unix 秒
 #if defined(AAPS_DANA_HOST_TEST)
@@ -100,6 +101,21 @@ void rtc_set_unix(uint32_t unix_sec)
     s_set = true;
     g_pump_config.rtc_base_unix = unix_sec;
     storage_save_config(&g_pump_config);    // 持久化, 掉电前/重启后恢复
+}
+
+void rtc_set_zone_offset(int8_t zh) { s_zone_offset = zh; }
+int8_t rtc_get_zone_offset(void)   { return s_zone_offset; }
+
+// 本地墙钟 = UTC + offset*3600。未设置时间时兜底到编译时刻(本机墙钟) + offset,
+// 保证 0x78 始终回有效本地墙钟, 避免 AAPS 读到 1970 触发大时间差。
+uint32_t rtc_local_now(void)
+{
+    uint32_t u = rtc_unix_now();
+    if (u == 0) u = rtc_build_time_unix();   // 兜底: 编译时刻(本机墙钟的 UTC 秒)
+    int32_t off = (int32_t)s_zone_offset * 3600;
+    int32_t v = (int32_t)u + off;
+    if (v < 0) v = 0;
+    return (uint32_t)v;
 }
 
 /* ---- 周期性回写时钟基准 (详见 rtc_clock.h 的 AAPS 1.5h 硬门限说明) ---- */

@@ -84,8 +84,8 @@ float ui_hal_today_total(void)
 
 void ui_hal_get_clock(int *hh, int *mm)
 {
-    // RTC 风格时钟: 由 rtc_clock 维护的可设置/持久化时间
-    uint32_t u = rtc_unix_now();
+    // 显示本地墙钟 (UTC + 时区偏移), 而非裸 UTC
+    uint32_t u = rtc_local_now();
     if (u == 0) { *hh = -1; *mm = -1; return; }   // 未设置
     int y, mo, d, h, mi, s;
     rtc_unix_to_ymdhms(u, &y, &mo, &d, &h, &mi, &s);
@@ -444,7 +444,12 @@ bool ui_hal_clock_valid(void)    { return rtc_is_set(); }
 void ui_hal_set_time(uint32_t unix_sec) { rtc_set_unix(unix_sec); }
 void ui_hal_set_time_ymdhms(int y, int mo, int d, int h, int mi, int s)
 {
-    rtc_set_unix(rtc_ymdhms_to_unix(y, mo, d, h, mi, s));
+    // 用户输入的是本地墙钟, 转成真实 UTC 存储 (内部时钟一律存 UTC 秒)
+    uint32_t local = rtc_ymdhms_to_unix(y, mo, d, h, mi, s);
+    int32_t off = (int32_t)rtc_get_zone_offset() * 3600;
+    int32_t u = (int32_t)local - off;
+    if (u < 0) u = 0;
+    rtc_set_unix((uint32_t)u);
 }
 
 // ---- 显示 / 设置读取 ----
@@ -453,7 +458,8 @@ bool    ui_hal_dana_paired(void)    { return g_pump_state.dana_paired; }
 bool    ui_hal_get_keypad_sound(void) { return s_keypad_sound; }
 void    ui_hal_get_ymdhms(int *y, int *mo, int *d, int *h, int *mi, int *s)
 {
-    uint32_t u = rtc_unix_now();
+    // 读取本地墙钟供"设置时间"界面显示/编辑
+    uint32_t u = rtc_local_now();
     if (u == 0) { *y = 2026; *mo = 1; *d = 1; *h = 0; *mi = 0; *s = 0; return; }
     rtc_unix_to_ymdhms(u, y, mo, d, h, mi, s);
 }
