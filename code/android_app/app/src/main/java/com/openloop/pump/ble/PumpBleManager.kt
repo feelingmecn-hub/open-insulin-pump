@@ -78,6 +78,9 @@ class PumpBleManager @Inject constructor(
     private val _iob = MutableStateFlow(0.0)
     val iob: StateFlow<Double> = _iob.asStateFlow()
 
+    /** 连接后自动校时所用的协程作用域（连接回调不在协程内，需自行 launch）。 */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     private val _reservoir = MutableStateFlow(0)
     val reservoir: StateFlow<Int> = _reservoir.asStateFlow()
 
@@ -273,6 +276,9 @@ class PumpBleManager @Inject constructor(
             _connectionState.value = ConnectionState.Connected
             discoverDeferred?.complete(true)
             discoverDeferred = null
+            // 一连上就把手机时间写给泵, 自举泵 RTC（AAPS 在 |时差|>1.5h 时拒绝校时,
+            // 故必须由本 App 兜底, 否则 AAPS 会卡"大时间差"且无大剂量按钮）。
+            scope.launch { runCatching { syncTimeFromPhoneInternal() } }
         }
 
         override fun onCharacteristicWrite(
@@ -416,6 +422,21 @@ class PumpBleManager @Inject constructor(
         val char = cgmChar ?: return@withContext fail("未连接或未发现 CGM 特征")
         val payload = PumpProtocol.buildCgm(mgdl, trend)
         writeWithAck(gatt ?: return@withContext fail("GATT 未就绪"), char, payload)
+    }
+
+    /**
+     * 连接后自动把手机当前时间写给泵 RTC（小端 u32 Unix 秒）。
+     * 与 SettingsViewModel.syncTimeFromPhone 等价, 但放在 Manager 内便于连接回调直接 launch。
+     */
+    private suspend fun syncTimeFromPhoneInternal() {
+        val now = System.currentTimeMillis() / 1000L
+        val payload = byteArrayOf(
+            (now and 0xFF).toByte(),
+            ((now shr 8) and 0xFF).toByte(),
+            ((now shr 16) and 0xFF).toByte(),
+            ((now shr 24) and 0xFF).toByte()
+        )
+        requestSettings(PumpProtocolSpec.SET_OP_SET_TIME, payload)
     }
 
     /**
