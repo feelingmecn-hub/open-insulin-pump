@@ -110,7 +110,7 @@ fun DashboardScreen(viewModel: DashboardViewModel = hiltViewModel()) {
             MetricCard(
                 modifier = Modifier.weight(1f),
                 label = "IOB",
-                value = "%.2f U".format(iob)
+                value = "%.1f U".format(iob)
             )
             MetricCard(
                 modifier = Modifier.weight(1f),

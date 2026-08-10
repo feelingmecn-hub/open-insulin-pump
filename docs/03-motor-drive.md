@@ -250,8 +250,8 @@ DRV8825 支持三种电流衰减模式（DECAY 引脚）：
 ```cpp
 // ⚠️ 以下仅为「原理示意」, 真实工程不做手算硬编码 —— 全部集中在 dosing.h 单一真源:
 //   config.h 用 RESERVOIR_TYPE 选择储药罐类型 (CY13_DANA / CARTRIDGE_3ML ...),
-//   dosing.h 仅从「内腔直径」推导面积/每转体积/STEPS_PER_UNIT/STEPS_PER_005U,
-//   并定义 units_to_microsteps()/microsteps_to_units()/quantize_units_005() 三函数。
+//   dosing.h 仅从「内腔直径」推导面积/每转体积/STEPS_PER_UNIT/STEPS_PER_MIN_DOSE_U,
+//   并定义 units_to_microsteps()/microsteps_to_units()/quantize_units_grid() 三函数。
 //   切换耗材 = 改一个宏, 几何与换算全自动重算, 所有调用点零改动。
 //
 // 示意 (以「1mL 注射器 28.3mm²」为例, 非本项目实际值):

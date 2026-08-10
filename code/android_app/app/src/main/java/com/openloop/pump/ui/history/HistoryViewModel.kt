@@ -23,7 +23,7 @@ class HistoryViewModel @Inject constructor(
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val glucose = flow { emit(db.glucoseDao().recent(200)) }
-        .stateIn(viewModelScope, WhileSubscribed(5000), emptyList())
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val syncing = MutableStateFlow(false)
 

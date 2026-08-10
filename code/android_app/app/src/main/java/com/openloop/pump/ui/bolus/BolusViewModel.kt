@@ -14,6 +14,7 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
@@ -37,9 +38,9 @@ class BolusViewModel @Inject constructor(
     val sending = MutableStateFlow(false)
     val lastResult = MutableStateFlow<BolusOutcome?>(null)
 
-    /** 按 0.05U 步进设置剂量（精度上限）。 */
+    /** 按 0.1U 步进设置剂量（精度上限，与泵硬件可靠下限一致）。 */
     fun setUnits(value: Double) {
-        units.value = (value * 20).toInt().coerceAtLeast(0) / 20.0
+        units.value = (value * 10).toInt().coerceAtLeast(0) / 10.0
     }
 
     fun stepUnits(delta: Double) = setUnits(units.value + delta)
@@ -53,7 +54,7 @@ class BolusViewModel @Inject constructor(
         viewModelScope.launch {
             val isf = prefs.isf.first()
             val target = prefs.targetGlucose.first()
-            val algo = ClosedLoopAlgorithm(isf = isf, targetGlucose = target)
+            val algo = ClosedLoopAlgorithm()
             recommendedBolus.value = algo.recommendCorrectionBolus(
                 g.mgdl, iob.value, isf, target
             )

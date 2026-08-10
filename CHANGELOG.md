@@ -4,6 +4,123 @@
 
 ---
 
+## 2026-08-10 — 关键修复：环模式崩溃 / 基础率不执行 / 历史缺失 / 验证测试（v10 发布构建）
+
+> 用户实测四连击：App 切环模式→固件崩溃且重启仍显示闭环；设了基础率电机不动；历史只有大剂量；要求基础率验证测试按钮。根因均为设计层错误，非表面 bug。
+
+### ① App 切环模式崩溃 + 重启回闭环
+- **崩溃根因**：BLE 回调（中断上下文）里同步写 NVS flash。ESP32 擦写 flash 会关 flash cache，此刻 BLE ISR 取指落到禁用 cache → `Cache disabled but cached memory region accessed` panic 重启。
+- **修复**：所有持久化改为「标脏 + loop() 上下文去抖落盘」。`.ino::loop()` 接三个 flush（`storage_flush_tick` / `basal_history_flush_tick` / `history_log_tick`），每拍最多落一个，避免连击 flash 触发同款 panic。
+- **显示错误根因**：`loop_mode` 不在 `pump_config_t` 内，重启后 `pump_state_init()` 无条件置 0（闭环）。
+- **修复**：新增 `loop_mode_pref` 字段（**追加到结构体末尾**保证向前兼容），UI/BLE 两处切换都写；`storage_load_config` 改为仅 `n==0` 用默认（旧 `n!=sizeof` 丢弃会令旧 NVS 整份作废、24 段档案被清零）。
+
+### ② 设了基础率电机不动
+- **根因**：闭环取速率读 `g_pump_state.current_basal_rate`，而 **AAPS 从不写此字段**（真机模型=泵按 24 段档案自跑 + AAPS 用 0x66 下发档案 + TBR 增量）。0x66 把值写进 `g_pump_config.profiles[]`，闭环却不读 → rate 恒 0 → 永不入队 `MOTOR_CMD_BASAL_TICK`。
+- **修复**：闭环/开环统一读 `g_pump_config.profiles[active].slots[RTC墙钟整点].rate_uh`。整点由 `(millis()/3600000)%24`（开机后小时数，与真实时间无关，对昼夜档案是致命错）改为 RTC 墙钟；伴生 App BASAL 通道直推改为写 `basal_override_uh/_ms/_valid` 限时覆盖（旧只写 `current_basal_rate` 被下一拍覆盖=没写）。
+
+### ③ 历史只有大剂量
+- **修复（三重留痕）**：`dose_log` 逐条（3min 窗口，≈35 万条容量完整审计）+ `history_log` 按 `BASAL_HISTORY_AGG_MS`(30min) 聚合成一条（否则 32 条环形被 3 分钟一条挤爆、大剂量记录全没）+ `basal_history` 速率**变化**时打 `BH_BASAL_ACTIVE`（归零也收尾打 0 点）。
+
+### ④ 基础率验证测试按钮
+- **设计**：读**泵内档案**（非 App 页面编辑值），全天 24 段总量一次性打出，走大剂量物理路径但**不计大剂量次数 / 不计 IOB**（否则污染 AAPS IOB→闭环误判），历史 param2 存**实际微步数**供对照丝杠位移（屏显 `12.0U/1510步`）。一次定性区分「没写进去」vs「写进去了但电机不动」。
+- **入口**：泵屏 `设置→基础率方案→⑧ 验证测试·打全天量`；App 基础率页「验证测试」按钮（带二次确认）。
+- **诊断健壮**：返回 0 时显式报「全天总量为0! 基础率未写入泵」（而非静默退回误以为按钮坏）；`bh_dup()` 2 分钟去重排除 `BH_BASAL_TEST`，否则为对照行程连按两次被静默吞掉。
+- **伴生 App 修正**：`PumpUuids` 环模式常量原标反（`OPEN=0`/`CLOSED=1`，与固件真源 0=闭环相反），已改正；新增 `CTRL_CMD_BASAL_TEST=0x18`。
+
+### 发布构建
+- 新增 `basal_history.{h,cpp}` / `dose_log.{h,cpp}` 模块（基础率/大剂量执行留痕，去重保护 `BH_BASAL_TEST`）。
+- 两变体固件：`v10`（正式，`-DUSE_AAPS_DANA`）/ `v10-debug`（`-DMOTOR_DEBUG_UNLOCKED`，INA226 未接时用）。主机链路模拟器回归 **PASS=61 FAIL=0**。
+- ⚠️ 编译须 `--jobs 1` 串行（并行编库 .a 竞态会损坏 "is not an object"）。交付产物在桌面 `闭环泵固件v10/` 与 `闭环泵固件v10-debug/`。
+
+---
+
+## 2026-08-08 — BLE 健壮性：多连接 / 广播包布局 / NVS 延迟写 / 配置落库
+
+> 配套 8/10 的底层修复，先一步清掉 BLE 层的并发与持久化隐患。
+
+- **多连接并存**（华为系统连接 + AAPS 连接）：`onConnect` 内 `startAdvertising()`（否则 AAPS 白名单 connectGatt 扫不到→GATT_ERROR133 死循环）；`notify` 带 connHandle 定向投递；`onDisconnect` 仅断 Dana 对端才重置握手；`ble_connected=(getConnectedCount()>0)`。
+- **广播包 31B 上限**：AAPS 的 FFF0(16-bit) 进广播包，伴生 App 的 `6E400001`(128-bit) 溢入扫描响应；`setName()` 须在 `enableScanResponse(true)` 之前调用，否则设备名被塞进扫描响应→AAPS 搜不到。
+- **0x64/0x66/0x53 配置真落库**：原只回 OK 不写 `g_pump_config` → AAPS 每次连接读回比对不一致反复弹「设置配置文件」；改为真解析+写配置，落盘走标脏+1.5s 延迟（不在 BLE 回调里擦 flash）。`dana_unpack_packet` 的 params 缓冲扩到 ≥`DANA_MAX_PACKET`(128)，修复 0x53 后 48B(CF) 被静默截断。
+- **安全上限兜底 0/NaN**：`max_basal_per_hour` 为 0（旧 NVS/未初始化）时旧逻辑把 24 段全压成 0→泵完全不给基础率；改为字段≤0 时回退 `MAX_BASAL_RATE`。
+
+---
+
+## 2026-08-06 — 修复退药顶死丝杆 / 行程安全上限 / 前限位缺失 / 手动退药上限
+
+> 现象：退药"推到底卡死还在退"；运行几次后所有操作(打药)疑似反向、重启/断电池无效、自行恢复；手动退药量上限仅 50U(用户需 300U)。
+> 根因：① `REWIND_MAX_STEPS=700000` 注释误算(实际≈5563U), 远超 300U 储药器行程(≈37752步)；若后限位开关 `PIN_LIMIT_REV` 未接/失效则一路顶死；且调试宏 `MOTOR_DEBUG_UNLOCKED` 跳过堵转硬停 → 顶死还空转。② 大剂量/排气/标定 FORWARD 分支此前无前限位检测，近前端还打会顶死前限位。③ 丝杆顶死后的机械卡死表象被误判为"方向反转"。④ 手动退药 UI 上限 50U 过小。
+
+- **`config.h`**：`REWIND_MAX_STEPS` 700000 → **45000**(满容量300U×STEPS_PER_UNIT×1.15 兜底, 防无限位时超行程顶死)；新增 `RESERVOIR_MAX_STEPS=45000` 供正向边界兜底；注释纠正旧误算。
+- **`motor_controller.cpp`**：`motor_pulse()` 入口对 **FORWARD** 加通用限位/行程保护(`manual_limit_hit(FWD)` + `g_motor_position>=RESERVOIR_MAX_STEPS` 即停)，覆盖大剂量/排气/标定此前缺失的前限位检测；加 `manual_limit_hit` 前向声明。`motor_rewind_full()` 的堵转/丢步**物理停止**移出 `#ifndef MOTOR_DEBUG_UNLOCKED`(无论调试与否都停硬推, 仅报警区分), 彻底消除"卡死还退"。
+- **`ui_screen.cpp`**：手动退药量上限 50U → **300U**(步进 0.1U, 满足"最大300U距离可手动输入")。
+- **`ui_hal_fw.cpp`**：标定系数 `factor` 钳制 `<=0 或 >2.0` 重置为默认(防异常系数令 `units_to_microsteps` 步数爆炸顶死丝杆)。
+- **`dosing.h`**：`units_to_microsteps()` 结果封顶 60000 步(纵深防御异常系数)。
+- **待烧录（旧版, 已被下条 INA226 限位改造取代）**：本机编译通过(1210623字节)。⚠️ 用户确认**本项目无硬件限位开关**，原 `PIN_LIMIT_FWD/REV=GPIO2/3` 实为 ESP32-C6 USB-D+/D-，旧"确认限位开关已接好"建议作废。
+
+---
+
+## 2026-08-06 (2) — 限位检测改为 INA226 堵转电流（移除 GPIO2/3 伪限位）
+
+> 用户确认：硬件未设计限位开关，限位今后由 INA226 电流判断。原 `manual_limit_hit()` / `safety_monitor` 读 `PIN_LIMIT_FWD=2`/`PIN_LIMIT_REV=3`，而这俩脚是 ESP32-C6 的 USB-D+/D-（CDCOnBoot=cdc 下被 USB-CDC 占用），读到的是 USB 差分信号(垃圾值) → 既造成"退药卡死还退"(限位永 false)，也制造随机怪象。
+
+- **`config.h`**：删除 `PIN_LIMIT_FWD/PIN_LIMIT_REV` 定义(改为注释说明无硬件限位+限位改 INA226)；新增 `STALL_OCCL_CONSEC=5` / `STALL_NOLOAD_CONSEC=5` 堵转/丢步去抖连续采样阈值(滤除启动浪涌/瞬态尖峰)。
+- **`motor_controller.cpp`**：`motor_stall_guard_tick()` 改为连续 5 采样超阈值才置 `g_occlusion`/`g_step_loss`(去抖)；`motor_pulse()` 等待循环内**堵转即立即停脉冲**(不等整批)，且堵转/丢步**无论调试/正式构建都返回 false 中止运动**(调试仅不弹 ALARM)，彻底消除"顶死还退"/"顶死前限位还打"；`manual_limit_hit()` 改为返回 `g_occlusion`(INA226 堵转=到限位, 方向无关)；`motor_init()` 不再配置 GPIO2/3 限位引脚。
+- **`safety_monitor.cpp`**：删除 GPIO 限位引脚配置与 `ALARM_LIMIT_TRIGGERED` 的 GPIO 触发(改由 INA226 堵转经 `ALARM_OCCLUSION` 体现)。
+- **`dist/windows/firmware_src/src/`**：同步 config.h / motor_controller.cpp / safety_monitor.cpp。
+- **编译**：本机编译通过(1210617字节, 带 `-DMOTOR_DEBUG_UNLOCKED`)。需泵进 boot 烧录验证；正式发布须去掉调试宏。
+- ⚠️ **安全红线补充**：严禁在泵由 3S 电池供电运行时给同一电池接平衡充/充电器(用户实测曾因此致 DIR 引脚瞬态闩锁、所有操作反向, 断电后自愈)。充电前先断开泵供电或拆电池单独充。
+
+---
+
+## 2026-08-06 (3) — 主屏实时显示 INA226 电流（调试堵转阈值标定）
+
+> 用户需求：实时显示电机电流，便于调试观察"啥样的电流是堵转"。
+
+- **`pump_types.h` / `pump_state.h` / `pump_state.cpp`**：`motor_current_ma` 语义由"运动峰值"改为**实时电流(运动/空闲均采样)**；新增 `motor_current_peak_ma`(单次运动峰值, 供标定堵转阈值)；新增 `pump_state_update_motor_current_peak()`。
+- **`motor_controller.cpp`**：`motor_stall_guard_tick()` 每 5ms 采样即写实时电流到 `pump_state.motor_current_ma`；运动结束写峰值到 `motor_current_peak_ma`。
+- **`safety_monitor.cpp`**：`safety_task` 周期(每 `SAFETY_TASK_INTERVAL_MS`)读 INA226 电流刷新实时电流——电机空闲时也持续采样(作 LCD 实时显示数据源)。
+- **`ui_screen.cpp`**：主屏右栏 y108 新增"电流 XXX mA"行；`≥ occlusion_threshold` 显示**红色"堵转!"**，正常绿、无电流灰；今日/IOB 行下移至 y122 避让。主屏由 `ui_screen_periodic()` 周期重绘, 电流实时刷新。
+- **`dist/windows/firmware_src/src/`**：同步上述 6 文件。
+- **编译**：本机编译通过(1210897字节, 带 `-DMOTOR_DEBUG_UNLOCKED`)。需泵进 boot 烧录验证；正式发布须去掉调试宏。BLE 状态包(20字节)已满, 本次未新增 BLE 通道(仅 LCD 显示; 手机侧如需看电流可后续加独立 CURRENT 通道)。
+
+---
+
+## 2026-08-05 — 最小可靠剂量下限 0.05U → 0.1U（落实"做不到的精度不显示/不支持"原则）
+
+> 依据实测 CY-13 储药罐（PHRay 3mL，内腔 Φ11.38mm）与机械误差分析：整机实际可靠精度仅 ±0.1~0.3U（丝杆背隙为主，标定只能修系统偏移、修不了随机背隙/丢步）。故将系统最小可靠单剂量下限统一提到 0.1U，与丹纳原厂大剂量增量一致。
+
+- **`config.h`**：`MIN_DOSE_UNITS` 0.05f → **0.1f**（全系统剂量网格 / 单剂量下限）；`BOLUS_GRAN_FINE` 同步 0.05f → 0.1f（大剂量最细分批粒度）；标定系数注释「笔芯内径」→「储药罐内径」。
+- **`dosing.h`（单一真源）**：吸附函数 `quantize_units_005` 重命名为 `quantize_units_grid`（内部仍用 `MIN_DOSE_UNITS`，改宏即联动）；宏 `STEPS_PER_005U` → `STEPS_PER_MIN_DOSE_U`；剂量诚实性原则注释更新——物理分辨率随 11.38mm 直径变为 ≈0.0079U/微步，但对外承诺下限取 0.1U。
+- **UI（`ui_screen.cpp`）**：大剂量/立即量/方波量/手动退药/实测体积 等所有剂量步进与下限 0.05 → 0.1；基础率设置步进 `BASAL_RATE_STEP` 0.05 → 0.1；上述剂量显示由 `%.2f` 改为 `%.1f`（不对外声称 0.01U 精度）；向导大剂量建议值先 `quantize_units_grid` 再投递，屏上显示与实投一致。
+- **后端/边界**：`ui_hal_fw.cpp`（基础率、大剂量吸附、手动退药/标定下限）、`ble_comm.cpp`（标定出测试量下限）、`ui_hal_link.cpp` / `link_session.cpp`（模拟器后端）同步改名与 0.1 下限；`dist/windows/firmware_src` 分发副本、`docs/03-motor-drive.md` / `05-firmware-design.md` 同步。
+- **不受影响**：基础率连续投递走微步累加器（不受 `MIN_DOSE_UNITS` 闸门，仍可平滑输送）；延展量逐拍下限 `EXT_BOLUS_MIN_UNITS=0.005` 刻意远低于 0.1U 以保持连续，保留。
+
+---
+
+## 2026-08-05 — 安卓控制 App 同步 0.1U（与固件对齐）
+
+> 固件已统一最小可靠剂量下限到 0.1U（`MIN_DOSE_UNITS`/`BOLUS_GRAN_FINE`=0.1，剂量显示 `%.1f`）。安卓控制 App 同步对齐，避免 App 端还能选 0.05U 或显示 0.01U 假精度，与泵行为不一致。
+
+- **`BolusViewModel.kt`**：剂量量化 `(value*20)/20.0` → `(value*10)/10.0`，真正剂量网格由 0.05U 改为 **0.1U**（与固件 `MIN_DOSE_UNITS` 一致）；注释同步。
+- **`BolusScreen.kt`**：步进按钮 `±0.05` → `±0.1`、提示「步进 0.05U」→「步进 0.1U」；大剂量数值 / 推荐校正剂量 / 确认推注 显示 `%.2f` → `%.1f`。
+- **`BolusRequest.kt`**：剂量精度注释 0.05U → 0.1U。
+- **胰岛素量显示统一 `%.1f`**：镜像屏（剩余药量本就是 0.1U；IOB / 基础率 / 今日累计 / 常规·方波·双波大剂量菜单剂量）、基础率编辑（BasalScreen / BasalProfileScreen）、历史记录、仪表盘 IOB、设置页「标定测试量 / 排气量」确认文案，全部 `%.2f` → `%.1f`。
+- **`SettingsViewModel.kt`**：标定推出测试量 `coerceIn` 下限 `0.05f` → `0.1f`（排气量下限本就是 0.1f，无需改）。
+- **协议层**：BLE 大剂量仍走 `units_x100`（0.1U=10），无编码变更；固件 IOB 通知当前仍为 `%.2f` ASCII，App 解析后按 `%.1f` 显示（显示已一致，固件文本格式如需收紧可后续单独处理）。
+
+---
+
+## 2026-08-05 — 修复 AAPS 蓝牙配对失败（Passkey Entry → Just Works）
+
+> 现象：AAPS 与系统蓝牙配对均弹 6 位码、点配对后超时失败；自研 App 不配对也能控泵（加密在应用层）。
+> 根因：`aaps_dana.cpp` 原 `setSecurityIOCap(KEYBOARD_DISP)` + `setSecurityAuth(true,true,true)`（强制 MITM）触发 Passkey Entry；协商后 Android 成 Display 端要求泵确认，但 `onConfirmPassKey()` 空实现 → 泵不确认 → 超时失败。
+
+- **`aaps_dana.cpp`**：配对改为 **Just Works**（`setSecurityAuth(true,false,true)` bond+LESC、MITM 关；`setSecurityIOCap(NO_IO)`）。Dana-i 真正安全靠应用层 `DANAI_BLE5_KEY` 加密握手（不依赖链路层 MITM），AAPS 仅要求 bond 成功。Android 不再弹 6 位码，改为「是否配对」确认框，点一下即成功。`onConfirmPassKey`/`onPassKeyDisplay` 注释说明 NO_IO 下不触发（保留兼容若改回 DISPLAY_ONLY 的 passkey 场景）。
+- **`DANAI_BLE5_KEY` 仍为 `"123456"`**（合法 6 位，atoi 无误；仅 passkey 流程不再走它）。
+- **待烧录**：本机已编译通过（1210479 字节），需泵进 boot 后用 `-u` 烧录验证；正式发布版仍须去掉 `-DMOTOR_DEBUG_UNLOCKED`。
+
+---
+
 ## 2026-07-28 — AAPS 闭环联调同步演示（四宫格 GUI + 一键启动器）
 
 > 为向他人无硬件演示「AAPS 发令 → 固件收令 → 电机推药 → 泵屏响应」完整闭环，新增桌面联调同步演示。

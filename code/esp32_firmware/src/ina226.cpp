@@ -1,9 +1,15 @@
 /**
  * ina226.cpp — INA226 驱动 (Arduino Wire)
  */
+#include <Arduino.h>
 #include "ina226.h"
 #include "config.h"
 #include <Wire.h>
+
+// INA226 芯片在线标志: ina226_init() 自检通过后置 true。
+// 测试阶段芯片可能未焊接/未接, 此时无电流数据, 调用方据此跳过堵转/丢步/过流判定,
+// 避免误报与误中止电机。接上芯片(init 自检通过)后自动恢复保护。
+bool g_ina226_online = false;
 
 // 寄存器
 #define INA226_REG_CONFIG   0x00
@@ -46,7 +52,8 @@ bool ina226_init(void)
     // 校准寄存器: 0.00512 / (CurrentLSB * Rshunt) = 2048
     write_reg(INA226_REG_CALIB, INA226_CAL_VALUE);
 
-    return ina226_self_test();
+    g_ina226_online = ina226_self_test();
+    return g_ina226_online;
 }
 
 bool ina226_self_test(void)

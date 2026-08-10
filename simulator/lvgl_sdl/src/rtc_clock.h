@@ -29,6 +29,17 @@ bool rtc_is_set(void);
 // 设置时间 (同时持久化到 storage)
 void rtc_set_unix(uint32_t unix_sec);
 
+// 周期性回写时钟基准 (主循环调用, 内部自带节流)
+//
+// ⚠️ 为什么必须有它 (2026-08-08):
+//    本机无备份电池, 掉电后 RTC 域清零, 开机只能从 g_pump_config.rtc_base_unix 恢复。
+//    若该基准只在"用户设置时间"那一刻写入, 每次重启时钟都会**倒退回上次设置的时刻**
+//    —— 停机一天就差一天。而 AAPS(DanaRSService.readPumpStatus) 在
+//    |timeDiff| > 1.5h 时会 runAlarm(largetimediff) + danaPump.reset() 并直接 return,
+//    **不会**下发 0x79 去纠正 → 初始化就此失败、反复重连。
+//    故这里每隔一段时间回写一次, 把重启后的时间倒退量限制在该间隔以内。
+void rtc_clock_tick(void);
+
 // 日历 <-> Unix 互转 (UTC, 简化格里高利)
 //   声明为 inline, 使模拟器后端(ui_hal_sim.cpp)无需链接 rtc_clock.cpp 即可复用,
 //   保证固件与模拟器算法完全一致。

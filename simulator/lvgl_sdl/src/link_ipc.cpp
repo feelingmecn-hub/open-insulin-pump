@@ -4,6 +4,9 @@
  */
 #include "link_ipc.h"
 #include "link_session.h"
+#include "ui_screen.h"   // ui_screen_key (手动按键注入固件 FSM)
+#include "ui_hal.h"      // key_event_t / KEY_*
+extern void link_set_board_temp_c(float c);   // P3-13: 联调板温注入 (定义于 ui_hal_link.cpp)
 
 #include <cstdio>
 #include <cstring>
@@ -13,17 +16,33 @@
 #include <mutex>
 #include <thread>
 
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
+#ifdef _WIN32
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+#else
+    #include <sys/socket.h>
+    #include <netinet/in.h>
+    #include <arpa/inet.h>
+    #include <unistd.h>
+#endif
 
 namespace linkipc {
 
+// 跨平台 socket 抽象: macOS/Linux 用 POSIX (int fd + close), Windows 用 Winsock (SOCKET + closesocket + WSAStartup)
+#ifdef _WIN32
+    typedef SOCKET  sock_t;
+    #define SOCK_INVALID INVALID_SOCKET
+    #define SOCK_CLOSE(s) closesocket(s)
+#else
+    typedef int     sock_t;
+    #define SOCK_INVALID (-1)
+    #define SOCK_CLOSE(s) ::close(s)
+#endif
+
 static const int LINK_PORT = 18923;
 
-static int               g_listen = -1;
-static std::vector<int>  g_clients;
+static sock_t            g_listen = SOCK_INVALID;
+static std::vector<sock_t> g_clients;
 static std::mutex        g_mtx;
 static bool              g_run = true;
 
@@ -33,8 +52,8 @@ static void broadcast(const char *line)
     std::lock_guard<std::mutex> lk(g_mtx);
     for (size_t i = 0; i < g_clients.size(); ) {
         int fd = g_clients[i];
-        ssize_t w = ::send(fd, line, n, 0);
-        if (w <= 0) { ::close(fd); g_clients.erase(g_clients.begin() + (long)i); }
+        int w = ::send(fd, line, n, 0);
+        if (w <= 0) { SOCK_CLOSE(fd); g_clients.erase(g_clients.begin() + (long)i); }
         else i++;
     }
 }
@@ -68,7 +87,7 @@ void broadcast_reset(void)
 
 static void handle_cmd(const char *raw)
 {
-    char line[256];
+    char line[70000];
     strncpy(line, raw, sizeof(line) - 1);
     line[sizeof(line) - 1] = '\0';
     size_t L = strlen(line);
@@ -91,14 +110,43 @@ static void handle_cmd(const char *raw)
     } else if (strncmp(line, "delay ", 6) == 0) {
         int d = atoi(line + 6);
         if (d >= 0) { linksess::set_delay(d); build_and_broadcast(); }
+    } else if (strncmp(line, "mode ", 5) == 0) {
+        const char *m = line + 5;
+        if (strcmp(m, "replay") == 0)      linksess::set_mode(1);
+        else if (strcmp(m, "script") == 0) linksess::set_mode(0);
+        build_and_broadcast();
+    } else if (strncmp(line, "data ", 5) == 0) {
+        linksess::load_dataset(line + 5);   // 载入血糖曲线 + 基础率档案
+        build_and_broadcast();
+    } else if (strncmp(line, "key ", 4) == 0) {
+        // 手动控制: 把泵屏 4 个物理按键(上/下/确认/返回)注入固件 FSM
+        const char *k = line + 4;
+        if (strcmp(k, "release") == 0) {
+            ui_screen_release();     // 物理按键释放 -> 停止"长按自动重复"
+        } else {
+            key_event_t ke; bool ok = false;
+            if      (strcmp(k, "up")   == 0) { ke = KEY_UP;   ok = true; }
+            else if (strcmp(k, "down") == 0) { ke = KEY_DOWN; ok = true; }
+            else if (strcmp(k, "set")  == 0) { ke = KEY_SET;  ok = true; }
+            else if (strcmp(k, "esc")  == 0) { ke = KEY_ESC;  ok = true; }
+            if (ok) {
+                ui_screen_key(ke);
+                build_and_broadcast();   // 按键后立即推送新界面状态给控制面板
+            }
+        }
+    } else if (strncmp(line, "thermal ", 8) == 0) {
+        // P3-13: 注入板温(°C)以演示过温预警/报警状态机, 如 "thermal 62.5"
+        float c = (float)atof(line + 8);
+        link_set_board_temp_c(c);
+        build_and_broadcast();
     }
 }
 
-static void client_loop(int fd)
+static void client_loop(sock_t fd)
 {
-    char buf[512];
+    char buf[70000];
     while (g_run) {
-        ssize_t r = ::recv(fd, buf, sizeof(buf) - 1, 0);
+        int r = ::recv(fd, buf, sizeof(buf) - 1, 0);
         if (r <= 0) break;
         buf[r] = '\0';
         char *p = buf;
@@ -110,7 +158,7 @@ static void client_loop(int fd)
             p = nl + 1;
         }
     }
-    ::close(fd);
+    SOCK_CLOSE(fd);
     std::lock_guard<std::mutex> lk(g_mtx);
     for (auto it = g_clients.begin(); it != g_clients.end(); ++it) {
         if (*it == fd) { g_clients.erase(it); break; }
@@ -120,8 +168,8 @@ static void client_loop(int fd)
 static void server_loop(void)
 {
     while (g_run) {
-        int fd = ::accept(g_listen, nullptr, nullptr);
-        if (fd < 0) { if (!g_run) break; continue; }
+        sock_t fd = ::accept(g_listen, nullptr, nullptr);
+        if (fd == SOCK_INVALID) { if (!g_run) break; continue; }
         {
             std::lock_guard<std::mutex> lk(g_mtx);
             g_clients.push_back(fd);
@@ -133,10 +181,14 @@ static void server_loop(void)
 
 void start(void)
 {
+#ifdef _WIN32
+    // Windows 必须先初始化 Winsock, 否则任何 socket 调用都失败
+    { WSADATA wsa; if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { fprintf(stderr, "[link_ipc] WSAStartup failed\n"); return; } }
+#endif
     g_listen = socket(AF_INET, SOCK_STREAM, 0);
-    if (g_listen < 0) { perror("link_ipc socket"); return; }
+    if (g_listen == SOCK_INVALID) { perror("link_ipc socket"); return; }
     int opt = 1;
-    setsockopt(g_listen, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    ::setsockopt(g_listen, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -145,10 +197,10 @@ void start(void)
     addr.sin_port        = htons(LINK_PORT);
 
     if (bind(g_listen, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("link_ipc bind"); ::close(g_listen); g_listen = -1; return;
+        perror("link_ipc bind"); SOCK_CLOSE(g_listen); g_listen = SOCK_INVALID; return;
     }
     if (listen(g_listen, 8) < 0) {
-        perror("link_ipc listen"); ::close(g_listen); g_listen = -1; return;
+        perror("link_ipc listen"); SOCK_CLOSE(g_listen); g_listen = SOCK_INVALID; return;
     }
     printf("[link_ipc] 控制通道已启动 127.0.0.1:%d\n", LINK_PORT);
     fflush(stdout);

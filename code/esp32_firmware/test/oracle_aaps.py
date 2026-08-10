@@ -136,10 +136,10 @@ def main():
         print("PKT %s %s" % (name, pkt.hex()))
 
     # 命名场景（与 C 测试 aaps_dana_test.cpp 完全一致）
-    emit("PUMP_CHECK_RESP", 0x02, 0x00,
+    emit("PUMP_CHECK_RESP", 0x01, 0x00,
          [ord('O'), ord('K'), 0x00, 0x09, 0x00, 0x0A,
           ord('1'), ord('2'), ord('3'), ord('4'), ord('5'), ord('6')], 0)
-    emit("TIME_INFO_RESP", 0x02, 0x01, [ord('O'), ord('K')], 0)
+    emit("TIME_INFO_RESP", 0x01, 0x01, [ord('O'), ord('K')], 0)
     emit("CMD_BOLUS_RESP", 0xB2, 0x4A, [0x00], 1)
     emit("NOTIFY_RATE", 0xC3, 0x02, [0x2C, 0x01], 1)
     emit("CMD_TBR_PHONE", 0xA1, 0xC1,

@@ -2,10 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 生成 LVGL 格式的中文字体 C 文件 (bpp=4, SPARSE_TINY cmap)。
-- 从 ui_screen.cpp / ui_screen.h / ui_hal_sim.cpp / mock_hal.cpp 的双引号字符串中提取字符集
-- 额外补全: 全部可打印 ASCII (0x20-0x7E) + 常用泵 UI 汉字
-- 用系统黑体 (Heiti SC, 简体) 子集化, 再用 Pillow 渲染灰度位图。
-- 输出 lv_font_cn_16.c / lv_font_cn_12.c (bpp=4, 16级灰阶, ~50%体积)
+- 从 ui_screen.cpp / ui_screen.h (真机固件目录与 PC 模拟器目录, 二者共用同一份 UI 文本)
+  提取所有非 ASCII 显示字符 (quote-agnostic, 不依赖脆弱的正则)
+- 额外补全: 全部可打印 ASCII (0x20-0x7E) + 关键符号 + 常用泵 UI 汉字安全网
+- 主渲染字体: 系统黑体 Heiti SC (STHeiti Light.ttc, face 1)
+- 缺字回退: Apple Symbols (覆盖 ⚠/✔ 等主字体缺失的符号)
+- 用 Pillow 渲染灰度位图。
+- 输出 lv_font_cn_16.c / lv_font_cn_12.c (bpp=4, 16级灰阶)
 
 LVGL 9.5.0 字形放置公式 (lv_draw_label.c:624):
     x1 = pos.x + ofs_x
@@ -16,26 +19,36 @@ bpp=4 打包规则:
     每字节存 2 像素, 高 nibble = 左/上像素, 低 nibble = 右/下像素。
     若总像素数为奇数, 末字节低 nibble 补零。
     LVGL draw 时将 0~15 线性映射到 0~255 alpha。
+
+重要: 单次 cmap 用 SPARSE_TINY 且 glyph_id_ofs_list = NULL, 此时 glyph id = glyph_id_start + 索引。
+       数组索引 0 处固定插入占位符 U+0000, 让所有真实字符从索引 1 开始, 以避开
+       LVGL `get_glyph_dsc_fmt_txt` 的 `if(!gid) return false;` 守卫 (gid==0 会被当作字形未找到)。
 """
-import os, re
+import os, glob
 from fontTools.ttLib import TTFont
-from fontTools.subset import Subsetter, Options
 from PIL import Image, ImageFont, ImageDraw
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC_TTC = "/System/Library/Fonts/STHeiti Light.ttc"
 FACE = 1  # Heiti SC (简体)
+APPLE_SYM = "/System/Library/Fonts/Apple Symbols.ttf"
+ARIAL_UNI = "/Library/Fonts/Arial Unicode.ttf"
 SIZES = [(16, "lv_font_cn_16"), (12, "lv_font_cn_12")]
 
-# ---- 1. 从源码提取字符集 ----
+# ---- 1. 从 UI 显示源码提取字符集 (真机与模拟器共用 ui_screen.cpp) ----
 chars = set()
-for fn in ["ui_screen.cpp", "ui_screen.h", "mock_hal.cpp", "ui_hal_sim.cpp"]:
-    p = os.path.join(HERE, fn)
-    if not os.path.exists(p):
-        continue
-    txt = open(p, encoding="utf-8").read()
-    for s in re.findall(r'"([^"]*)"', txt):
-        for ch in s:
+SCAN_DIRS = [
+    HERE,                                                          # 模拟器目录 (simulator/lvgl_sdl/src)
+    os.path.abspath(os.path.join(HERE, "..", "..", "..", "code", "esp32_firmware", "src")),
+]
+SCAN_FILES = ["ui_screen.cpp", "ui_screen.h"]
+for d in SCAN_DIRS:
+    for fn in SCAN_FILES:
+        p = os.path.join(d, fn)
+        if not os.path.exists(p):
+            continue
+        txt = open(p, encoding="utf-8", errors="ignore").read()
+        for ch in txt:
             if ord(ch) >= 0x20:
                 chars.add(ch)
 
@@ -44,7 +57,11 @@ for fn in ["ui_screen.cpp", "ui_screen.h", "mock_hal.cpp", "ui_hal_sim.cpp"]:
 for cp in range(0x20, 0x7F):
     chars.add(chr(cp))
 
-# ---- 3. 补全常用泵 UI 汉字 (防止运行时拼接遗漏) ----
+# ---- 3. 关键符号 (即使源码未出现也保证存在) ----
+for sym in "\u2014\u2026\u2192\u2191\u2193\u2196\u2197\u2198\u2199\u25B2\u25BC\u25B6\u25C0\u26A0\u2713\u2714\u2717":
+    chars.add(sym)
+
+# ---- 4. 补全常用泵 UI 汉字 (防止运行时拼接遗漏) ----
 extra_cjk = (
     "总 量 值 设 单 位 毫 升 国际 单位 毫摩尔 每 升 小 时"
     "分 秒 周 月 年 版 本 号 硬 件 型 固 件 信 息"
@@ -68,35 +85,28 @@ for ch in extra_cjk:
     if ch != ' ':
         chars.add(ch)
 
-# 补全特殊符号
-for sym in "\u2192\u2191\u2193\u2196\u2197\u2198\u2199\u25B2\u25BC\u25B6\u25C0\u26A0\u2713\u2717":
-    chars.add(sym)
-
 print("字符集大小:", len(chars))
 
-# ---- 4. 子集化黑体 (含占位符 U+0000) ----
-font = TTFont(SRC_TTC, fontNumber=FACE)
-opts = Options()
-opts.glyph_names = False
-opts.notdef_outline = True
-opts.recalc_bounds = False
-ss = Subsetter(options=opts)
-all_chars_for_subset = set(chars)  # copy
-all_chars_for_subset.add('\x00')   # 确保占位符在子集中
-ss.populate(text="".join(sorted(all_chars_for_subset)))
-ss.subset(font)
-tmp = os.path.join(HERE, "cn_subset.ttf")
-font.save(tmp)
+# ---- 5. 准备字体 (主 + 回退) ----
+heiti = TTFont(SRC_TTC, fontNumber=FACE)
+heiti_cmap = heiti.getBestCmap()
+apple = TTFont(APPLE_SYM, fontNumber=0)
+apple_cmap = apple.getBestCmap()
+arial = TTFont(ARIAL_UNI, fontNumber=0)
+arial_cmap = arial.getBestCmap()
 
-# ---- 5. 渲染每个字号 -> C ----
-# 关键: LVGL 的 get_glyph_dsc_fmt_txt 有 `if(!gid) return false;` 守卫
-#       glyph_id == 0 会被当作"字形未找到"而显示 □
-#       因此在数组索引 0 处插入一个占位符(U+0000 NULL),
-#       让所有真实字符从索引 1 开始, 避免 gid==0
 
-chars_sorted = sorted(chars, key=lambda c: ord(c))
-PLACEHOLDER = '\x00'  # NULL 字符, 不会被正常 UI 文本用到
-chars_sorted_with_placeholder = [PLACEHOLDER] + list(chars_sorted)
+def pick_font(cp):
+    """返回该 codepoint 应使用的字体键名; 都不支持则返回 None。
+    优先级: 黑体(Heiti SC) -> Apple Symbols(符号) -> Arial Unicode(兜底符号/CJK)。"""
+    if cp in heiti_cmap:
+        return "heiti"
+    if cp in apple_cmap:
+        return "apple"
+    if cp in arial_cmap:
+        return "arial"
+    return None
+
 
 def render_glyph(f, ch, H, adv):
     """渲染单个字形, 返回 (bitmap_bytes, box_w, box_h, ofs_x, ofs_y)。"""
@@ -206,23 +216,49 @@ def write_c(name, bitmaps, glyph_dsc, unicode_list, H, base_line):
 
 
 for size, name in SIZES:
-    f = ImageFont.truetype(tmp, size)
-    ascent, descent = f.getmetrics()
+    fonts = {
+        "heiti": ImageFont.truetype(SRC_TTC, size, index=FACE),
+        "apple": ImageFont.truetype(APPLE_SYM, size, index=0),
+        "arial": ImageFont.truetype(ARIAL_UNI, size, index=0),
+    }
+    ascent, descent = fonts["heiti"].getmetrics()
     H = ascent + descent
     bitmaps = bytearray()
     glyph_dsc = []
     unicode_list = []
+    chars_sorted = sorted(chars, key=lambda c: ord(c))
+    PLACEHOLDER = '\x00'  # NULL 字符, 不会被正常 UI 文本用到
+    chars_sorted_with_placeholder = [PLACEHOLDER] + list(chars_sorted)
+
+    n_apple = 0
+    n_arial = 0
     for ch in chars_sorted_with_placeholder:  # 索引0=占位符, 真实字符从1开始
+        cp = ord(ch)
+        which = pick_font(cp)
+        if which is None:
+            # 主字体与回退字体都不支持: 占位空字形 (gid==0 守卫安全)
+            glyph_dsc.append((0, int(round(fonts["heiti"].getlength(ch) * 16)) if cp != 0 else 0, 0, 0, 0, 0))
+            unicode_list.append(cp)
+            continue
+        if which == "apple":
+            n_apple += 1
+        if which == "arial":
+            n_arial += 1
+        f = fonts[which]
         bm, w, h, ox, oy = render_glyph(f, ch, H, int(round(f.getlength(ch) * 16)))
         if w == 0 or h == 0:
             # 空字形(空格等): 占位但不存 bitmap
             glyph_dsc.append((0, int(round(f.getlength(ch) * 16)), 0, 0, 0, 0))
-            unicode_list.append(ord(ch))
+            unicode_list.append(cp)
             continue
         bidx = len(bitmaps)
         bitmaps += quantize_to_4bpp(bm)
         glyph_dsc.append((bidx, int(round(f.getlength(ch) * 16)), w, h, ox, oy))
-        unicode_list.append(ord(ch))
+        unicode_list.append(cp)
+    if n_apple:
+        print("  (%s) 回退到 Apple Symbols 的字形数: %d" % (name, n_apple))
+    if n_arial:
+        print("  (%s) 回退到 Arial Unicode 的字形数: %d" % (name, n_arial))
     write_c(name, bitmaps, glyph_dsc, unicode_list, H, ascent)
 
 print("DONE")

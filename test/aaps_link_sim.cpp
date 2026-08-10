@@ -28,6 +28,10 @@
 /* 测试钩子 (由 aaps_dana.cpp 在 AAPS_DANA_HOST_TEST 下定义) */
 extern "C" void aaps_dana_feed_rx_test(const uint8_t *data, size_t len);
 extern "C" void aaps_dana_reset_test(void);
+extern "C" void aaps_dana_host_link_up_test(void);   // 打开发送门控(模拟已连接+已订阅)
+/* 注：固件响应走异步发送队列，只有在 loop 上下文调用 aaps_dana_pump()（已在
+ * aaps_dana.h 声明）才真正 notify 出去。主机联调没有 loop，必须在每次喂包后
+ * 手动泵一次，否则响应滞留队列、host_drain_tx 永远抽不到东西。 */
 
 /* ---------- 统计 ---------- */
 static int g_pass = 0, g_fail = 0;
@@ -39,20 +43,25 @@ static int g_pass = 0, g_fail = 0;
 /* ---------- 对端(AAPS)上下文, 镜像固件握手状态 ---------- */
 static dana_ctx_t c_peer;
 
-/* 最近一次响应解析结果 */
+/* 最近一次响应解析结果
+ * 缓冲区必须 ≥ 最长响应参数区 = 0x52 GET_24_CIR_CF_ARRAY 的 97B，
+ * 也要能装下最长请求 0x53 SET_24_CIR_CF_ARRAY 的 96B 参数（整包 105B）。 */
+#define SIM_PARAM_CAP  128
+#define SIM_PKT_CAP    160
 static uint8_t  g_rt_type, g_rt_op;
-static uint8_t  g_rt_params[64];
+static uint8_t  g_rt_params[SIM_PARAM_CAP];
 static size_t   g_rt_nparams;
 
 /* ---------- 传输: 把构建好的信封喂给固件, 抽回并解析一个响应 ---------- */
 static int feed_and_recv(const uint8_t *pkt, size_t plen, bool expect_resp)
 {
     aaps_dana_feed_rx_test(pkt, plen);
+    aaps_dana_pump();              // 代替固件 loop：把队列里的响应真正 notify 出去
     if (!expect_resp) return 0;
-    uint8_t resp[128];
+    uint8_t resp[SIM_PKT_CAP];
     size_t rl = host_drain_tx(resp, sizeof(resp));
     if (rl == 0) return 0;                 // 固件未发响应 (被拒绝)
-    uint8_t t, op, pr[64];
+    uint8_t t, op, pr[SIM_PARAM_CAP];
     size_t np = 0;
     /* 注意：固件响应已由 host_tx_push 在分片边界整体二级解密（g_tx_ble5 启用后），
      * 故此处用 dana_unpack_packet（不再二次解密），否则会解成乱码。 */
@@ -65,7 +74,7 @@ static int feed_and_recv(const uint8_t *pkt, size_t plen, bool expect_resp)
 /* 发送握手类信封 (ENC_REQ, PUMP_CHECK / TIME_INFO) */
 static int send_enc(uint8_t enc_op, const uint8_t *params, uint8_t nparams)
 {
-    uint8_t pkt[64]; size_t pl = 0;
+    uint8_t pkt[SIM_PKT_CAP]; size_t pl = 0;
     int apply_ble5 = (c_peer.conn == DANA_CONN_HANDSHAKE_DONE) ? 1 : 0;
     if (dana_build_packet(&c_peer, pkt, &pl, DANA_TYPE_ENC_REQ, enc_op,
                           params, nparams, apply_ble5) != 0) return -1;
@@ -80,7 +89,9 @@ static int send_enc(uint8_t enc_op, const uint8_t *params, uint8_t nparams)
 /* 发送命令类信封 (命令阶段, BLE5) */
 static int send_cmd(uint8_t opcode, const uint8_t *params, uint8_t nparams)
 {
-    uint8_t pkt[64]; size_t pl = 0;
+    /* ⚠️ 0x53 SET_24_CIR_CF_ARRAY 的参数区就有 96B，整包 105B —— 旧的 pkt[64]
+     * 会让 dana_build_packet 直接失败，这类长写入命令根本发不出去。 */
+    uint8_t pkt[SIM_PKT_CAP]; size_t pl = 0;
     int apply_ble5 = (c_peer.conn == DANA_CONN_HANDSHAKE_DONE) ? 1 : 0;
     if (dana_build_packet(&c_peer, pkt, &pl, DANA_TYPE_COMMAND, opcode,
                           params, nparams, apply_ble5) != 0) return -1;
@@ -122,13 +133,32 @@ static void run_scripted(void)
     /* 握手完成：开启 TX 捕获侧的 BLE5 二级解密，使后续命令响应能按明文 LEN 重组 */
     host_tx_set_ble5(c_peer.ble5_enc_key);
 
-    /* ---- 3. GET_TIME (时钟未设置, 应回 2000-01-01) ---- */
-    printf("\n[3] GET_TIME (0x70) 时钟基准尚未设置\n");
+    /* ---- 3. GET_TIME (时钟未设置, 应回退到「固件编译时刻」) ----
+     * ⚠️ 这是有意设计, 不是 bug:
+     *   aaps_dana.cpp::dana_local_now() 在 rtc_unix_now()==0 时回退到
+     *   rtc_clock.h::rtc_build_time_unix()。原因有二:
+     *   ① AAPS 用 Joda DateTime 解析 y/m/d, month=0 或 day=0 会抛
+     *      IllegalFieldValueException → setReceived() 不执行 → 5 秒超时断开;
+     *   ② 编译时刻比 2000-01-01 更接近真实时间, AAPS 首次同步的时间差更小。
+     * 故断言口径 = 「日期必须合法且等于编译时刻」, 而非硬编码 2000-01-01。 */
+    printf("\n[3] GET_TIME (0x70) 时钟基准尚未设置 (应回退到固件编译时刻)\n");
     r = send_cmd(DANA_CMD_GET_TIME, NULL, 0);
     CHECK(r == 1, "GET_TIME 收到响应");
     CHECK(g_rt_nparams == 6, "GET_TIME 响应 6 字节");
-    CHECK(g_rt_params[0] == 0 && g_rt_params[1] == 1 && g_rt_params[2] == 1,
-          "未设时钟时回 2000-01-01 00:00:00");
+    {
+        int by, bmo, bd, bh, bmi, bs;
+        rtc_unix_to_ymdhms(rtc_build_time_unix(), &by, &bmo, &bd, &bh, &bmi, &bs);
+        printf("     泵回时间: 20%02d-%02d-%02d %02d:%02d:%02d  (编译时刻 %04d-%02d-%02d %02d:%02d:%02d)\n",
+               g_rt_params[0], g_rt_params[1], g_rt_params[2],
+               g_rt_params[3], g_rt_params[4], g_rt_params[5],
+               by, bmo, bd, bh, bmi, bs);
+        CHECK(g_rt_params[1] >= 1 && g_rt_params[1] <= 12 &&
+              g_rt_params[2] >= 1 && g_rt_params[2] <= 31,
+              "未设时钟时月/日仍合法 (防 AAPS Joda IllegalFieldValueException 断连)");
+        CHECK(g_rt_params[0] == (uint8_t)(by - 2000) &&
+              g_rt_params[1] == (uint8_t)bmo && g_rt_params[2] == (uint8_t)bd,
+              "未设时钟时回退到固件编译时刻 (dana_local_now 兜底生效)");
+    }
 
     /* ---- 4. SET_TIME (0x71) 设为 2026-07-28 13:30:00 ---- */
     printf("\n[4] SET_TIME (0x71) -> 2026-07-28 13:30:00\n");
@@ -234,12 +264,95 @@ static void run_scripted(void)
     CHECK(g_rt_op == DANA_CMD_SET_DUAL_BOLUS, "响应 opcode 正确回显 0x48");
     dump_state();
 
+    /* ---- 15b. AAPS「设置配置文件」写入 → 读回一致性 ----
+     * 对应真机现象：AAPS 设备信息页反复出现「设置配置文件」按钮。
+     * 根因是泵收到 0x64/0x66/0x53 只回 OK 不落盘，下次连接读回还是旧值。
+     * 这里用「写入 → 用对应的读取命令读回 → 逐字节比对」来锁死这条回归。 */
+    printf("\n[15b] AAPS 设置配置文件: 0x64/0x66/0x53 写入 -> 0x63/0x67/0x52 读回\n");
+
+    /* (a) 0x64 SET_PROFILE_NUMBER = 2 */
+    uint8_t pn[1] = { 2 };
+    r = send_cmd(DANA_CMD_SET_PROFILE_NUMBER, pn, 1);
+    CHECK(r == 1 && g_rt_params[0] == 0x00, "0x64 SET_PROFILE_NUMBER 回 OK");
+    r = send_cmd(DANA_CMD_PROFILE_NUMBER, NULL, 0);
+    CHECK(r == 1 && g_rt_nparams == 1 && g_rt_params[0] == 2,
+          "0x63 读回方案号 = 2 (写入已生效)");
+
+    /* (b) 0x66 SET_PROFILE_BASAL_RATE: 方案 2, 24 段 = 0.10..0.33 U/h 递增 */
+    uint8_t br[49];
+    br[0] = 2;
+    for (int i = 0; i < 24; i++) {
+        uint16_t x100 = (uint16_t)(10 + i);          // 0.10 U/h .. 0.33 U/h
+        br[1 + i * 2] = (uint8_t)(x100 & 0xFF);
+        br[2 + i * 2] = (uint8_t)(x100 >> 8);
+    }
+    r = send_cmd(DANA_CMD_SET_PROFILE_BASAL, br, 49);
+    CHECK(r == 1 && g_rt_params[0] == 0x00, "0x66 SET_PROFILE_BASAL_RATE(49B) 回 OK");
+
+    r = send_cmd(DANA_CMD_BASAL_RATE, NULL, 0);
+    CHECK(r == 1 && g_rt_nparams == 51, "0x67 读回 51B");
+    {
+        bool basal_ok = (g_rt_nparams == 51);
+        for (int i = 0; i < 24 && basal_ok; i++) {
+            uint16_t got = (uint16_t)(g_rt_params[3 + i * 2] |
+                                      ((uint16_t)g_rt_params[4 + i * 2] << 8));
+            if (got != (uint16_t)(10 + i)) {
+                printf("      段%d 期望 %u 实得 %u\n", i, (unsigned)(10 + i), (unsigned)got);
+                basal_ok = false;
+            }
+        }
+        CHECK(basal_ok, "0x67 读回 24 段基础率与 0x66 写入逐段一致 (持久化生效)");
+    }
+
+    /* (c) 0x53 SET_24_CIR_CF_ARRAY: 96B (24×CIR + 24×CF)。
+     *     这是整条链路最长的写入包 —— 同时验证 105B 整包的分片重组不被截断。 */
+    uint8_t cc[96];
+    for (int i = 0; i < 24; i++) {
+        uint16_t cir = (uint16_t)(8 + i);            // 8..31 g/U
+        uint16_t cf  = (uint16_t)(40 + i * 2);       // 40..86 mg/dL·U⁻¹
+        cc[i * 2]          = (uint8_t)(cir & 0xFF);
+        cc[i * 2 + 1]      = (uint8_t)(cir >> 8);
+        cc[48 + i * 2]     = (uint8_t)(cf & 0xFF);
+        cc[48 + i * 2 + 1] = (uint8_t)(cf >> 8);
+    }
+    r = send_cmd(DANA_CMD_SET_24_CIR_CF, cc, 96);
+    CHECK(r == 1 && g_rt_params[0] == 0x00, "0x53 SET_24_CIR_CF_ARRAY(96B) 回 OK");
+
+    r = send_cmd(DANA_CMD_24_CIR_CF_ARRAY, NULL, 0);
+    CHECK(r == 1 && g_rt_nparams == 97, "0x52 读回 97B (最长响应包未被截断)");
+    {
+        bool cc_ok = (g_rt_nparams == 97);
+        for (int i = 0; i < 24 && cc_ok; i++) {
+            uint16_t gcir = (uint16_t)(g_rt_params[1 + i * 2] |
+                                       ((uint16_t)g_rt_params[2 + i * 2] << 8));
+            uint16_t gcf  = (uint16_t)(g_rt_params[49 + i * 2] |
+                                       ((uint16_t)g_rt_params[50 + i * 2] << 8));
+            if (gcir != (uint16_t)(8 + i) || gcf != (uint16_t)(40 + i * 2)) {
+                printf("      时段%d 期望 CIR=%u CF=%u 实得 CIR=%u CF=%u\n",
+                       i, (unsigned)(8 + i), (unsigned)(40 + i * 2),
+                       (unsigned)gcir, (unsigned)gcf);
+                cc_ok = false;
+            }
+        }
+        CHECK(cc_ok, "0x52 读回 24×CIR/CF 与 0x53 写入逐段一致 (后 48B 的 CF 未被截断)");
+    }
+
+    /* (d) 畸形短包必须被安全忽略，不得把 profile 写坏 */
+    uint8_t shortp[8] = { 2, 1, 0, 1, 0, 1, 0, 1 };
+    r = send_cmd(DANA_CMD_SET_PROFILE_BASAL, shortp, 8);
+    CHECK(r == 1 && g_rt_params[0] == 0x00, "0x66 短包仍回 OK (不断连)");
+    r = send_cmd(DANA_CMD_BASAL_RATE, NULL, 0);
+    CHECK(r == 1 &&
+          (uint16_t)(g_rt_params[3] | ((uint16_t)g_rt_params[4] << 8)) == 10,
+          "0x66 短包被忽略, 原 24 段基础率未被破坏 (防御畸形包)");
+
     /* ---- 16. 安全: 篡改 CRC 的命令必须被拒绝 ---- */
     printf("\n[16] 安全校验 篡改 CRC 的命令被拒绝\n");
-    uint8_t pkt[64]; size_t pl = 0;
+    uint8_t pkt[SIM_PKT_CAP]; size_t pl = 0;
     dana_build_packet(&c_peer, pkt, &pl, DANA_TYPE_COMMAND, DANA_CMD_GET_TIME, NULL, 0, 1);
     pkt[pl - 3] ^= 0xFF;                       // 破坏 CRC 低字节
     aaps_dana_feed_rx_test(pkt, pl);
+    aaps_dana_pump();
     uint8_t junk[128];
     size_t rl = host_drain_tx(junk, sizeof(junk));
     CHECK(rl == 0, "篡改 CRC 的命令 -> 固件无响应 (完整性保护生效)");
@@ -336,7 +449,7 @@ static void run_interactive(void)
         if (oh < 0 || ol < 0) { printf("  opcode 解析失败\n"); continue; }
         uint8_t opcode = (uint8_t)(oh * 16 + ol);
 
-        uint8_t params[64];
+        uint8_t params[SIM_PARAM_CAP];   // 需容纳 0x53 的 96B 参数
         size_t np = 0;
         if (!parstr.empty() && !parse_hex_bytes(parstr, params, &np, sizeof(params))) {
             printf("  参数解析失败\n");
@@ -378,6 +491,7 @@ int main(int argc, char **argv)
     /* 挂载 Dana GATT 服务 (假 NimBLE), 初始化固件 g_dana_ctx */
     NimBLEServer fake_server;
     aaps_dana_attach(&fake_server);
+    aaps_dana_host_link_up_test();   // 模拟 AAPS 已连接 + 已订阅 FFF1, 打开发送门控
 
     bool interactive = false;
     for (int i = 1; i < argc; i++) {

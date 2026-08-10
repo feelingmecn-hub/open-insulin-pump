@@ -64,7 +64,10 @@ typedef enum {
     MOTOR_CMD_STOP,
     MOTOR_CMD_REWIND,
     MOTOR_CMD_CALIBRATE,
+    MOTOR_CMD_MANUAL,         // 完全手动电机控制 (电机测试): 定量前进/后退 或 连续点动(steps=0), 经 BLE CONTROL 0x15 下发
     MOTOR_CMD_CANCEL_BOLUS,   // 取消正在进行的大剂量 (置 abort 标志)
+    MOTOR_CMD_BASAL_TEST,     // 基础率验证测试: 把当前方案 24 段总量一次性打出(走大剂量的分段+安全复检路径,
+                              //   但历史记为 EVENT_TYPE_BASAL_TEST, 不计入大剂量次数/IOB, 便于对照电机行程核验)
 } motor_cmd_type_t;
 
 typedef enum {
@@ -88,9 +91,10 @@ typedef enum {
 
 typedef struct {
     motor_cmd_type_t type;
-    uint32_t         steps;        // 步数
+    uint32_t         steps;        // 步数 (MOTOR_CMD_MANUAL 中 steps=0 表示连续点动直到停止)
     uint16_t         speed_hz;     // 速度 Hz (0 = 默认)
     uint16_t         accel_hz;     // 加速度 (0 = 默认)
+    uint8_t          dir;          // 方向 MOTOR_DIR_FORWARD(0)/REVERSE(1) — 手动控制/通用命令使用
     uint32_t         delay_ms;     // 延迟执行 ms
     // 大剂量专用
     uint32_t         units_x100;   // 单位 × 100 (e.g. 500 = 5.00U)
@@ -143,6 +147,7 @@ typedef struct {
     float    lead_screw_pitch_mm;         // 丝杠导程
     uint16_t motor_microstep;             // 细分系数
     float    units_per_ml;                // 胰岛素浓度
+    float    dose_calibration;            // P3-14: 剂量标定系数 (实测/指令, 默认 1.0)
 
     // --- 安全参数 ---
     uint16_t occlusion_threshold;         // 阻塞检测阈值
@@ -152,12 +157,25 @@ typedef struct {
     // --- 显示 / 用户设置 (持久化, 供本地 UI 与独立手机 App 共用) ---
     uint8_t  display_brightness;          // 背光亮度 0-100 (%)
     uint8_t  keypad_sound;                // 0=关 1=开
+    uint8_t  vibrate_enabled;             // P3-15: 振动反馈开关 0=关 1=开 (默认关)
     uint32_t rtc_base_unix;               // 时钟基准 Unix 秒 (0 = 未设置)
+
+    // --- 省电 ---
+    uint8_t  auto_dim_enabled;            // 空闲自动熄屏 0=关 1=开 (默认开)
+    uint16_t auto_dim_timeout_s;          // 空闲超时(秒), 超时后关背光+关屏 (默认 30)
 
     // --- 统计 (累积) ---
     uint32_t total_units_x100_delivered;  // 累计注射单位 × 100
     uint32_t total_runtime_seconds;       // 累计运行秒数
     uint32_t total_bolus_count;           // 大剂量次数
+
+    // ⚠️ 新增字段一律追加在结构体末尾 ——
+    //    storage_load_config 依赖"旧存档字节数 < sizeof 时前缀仍可用"做向前兼容,
+    //    在中间插字段会让老存档整体错位(基础率方案被垃圾数据覆盖), 严禁。
+    // --- 环模式偏好 (2026-08-08 修复) ---
+    //    原先 loop_mode 只存在于运行时状态, 重启后 pump_state_init 必置 0=闭环,
+    //    表现为"App 里切了开环/暂停, 重启又显示闭环中"。现持久化并开机恢复。
+    uint8_t  loop_mode_pref;              // 0 闭环 / 1 开环 / 2 暂停
 } pump_config_t;
 
 // ============================================================
@@ -195,7 +213,7 @@ typedef struct {
     uint32_t     motor_max_position;      // 最大位置 (对应空储药器)
     bool         ble_connected;           // BLE 连接状态
     bool         is_primed;               // 是否已排气
-    int8_t       board_temp_c;            // 板载温度
+    float        board_temp_c;            // 板载温度(°C, P3-13: 过温检测源, 来自 ui_hal_get_board_temp_c)
     // --- 闭环 / 临时基础率 / 今日统计 ---
     uint8_t      loop_mode;               // 0 闭环(AAPS接管) / 1 开环(本地档案) / 2 暂停
     uint32_t     today_units_x100;        // 今日累计注射 (U × 100)
@@ -205,7 +223,8 @@ typedef struct {
     uint32_t     tbr_expiry_ms;           // 临时基础率到期时间 (millis())
     // --- INA226 实时遥测 ---
     uint16_t     battery_current_ma;      // 电池电流 mA
-    uint16_t     motor_current_ma;        // 电机电流 mA (运动期间)
+    uint16_t     motor_current_ma;        // 电机实时电流 mA (运动/空闲均采样, 见 motor_stall_guard_tick / safety_task)
+    uint16_t     motor_current_peak_ma;   // 电机峰值电流 mA (单次运动期间峰值, 用于标定堵转阈值)
     uint16_t     bus_power_mw;            // 母线功率 mW
     bool         step_loss_detected;      // 丢步/异常标志
     // --- 方波/双波延展量(按时间铺开, 由 basal_scheduler 驱动) ---
@@ -217,6 +236,27 @@ typedef struct {
     uint32_t ext_bolus_start_ms;        // 起始 millis()
     // --- Dana / AAPS 接管状态 ---
     bool     dana_paired;               // AAPS 已完成 Dana 握手接管 (闭环页区分显示)
+
+    // --- P0~P2 新增非阻塞状态/进度(单一真源, 模拟器共用同一份) ---
+    uint8_t  reservoir_low_warn;        // 低药量预警(非阻塞, 1=剩余≤阈值, 提示换笔芯)
+    uint8_t  keypad_locked;             // 按键锁 (1=锁定, 需长按"确认"解锁, 防误触)
+    uint8_t  bolus_progress_pct;        // 大剂量进度 (0-100, 首页/上报显示)
+    uint32_t bolus_delivered_x100;      // 当前大剂量已输注量 (U×100, 供 AAPS 0x40 进度查询/通知)
+    uint8_t  missed_bolus;              // 错过大剂量提醒标志 (1=有待处理提醒, 见 P2-12)
+    uint8_t  over_temp_warn;            // 过温预警(非阻塞, 1=接近阈值)
+
+    // --- 基础率速率覆盖 (伴生 App BASAL 通道直推; 2026-08-08) ---
+    //   闭环/开环模式下, 基础率的**真源是 g_pump_config.profiles[active].slots[hour]**
+    //   (AAPS 用 Dana 0x66 写这里, 真实 Dana-i 也是泵自己跑档案 + AAPS 用 TBR 调节)。
+    //   伴生 App 若通过 BASAL 通道直推一个瞬时速率, 记在这里做**限时覆盖**,
+    //   超时自动回落到档案, 避免 App 断连后泵被永久钉死在某个速率上。
+    float    basal_override_uh;         // 覆盖速率 U/h
+    uint32_t basal_override_ms;         // 覆盖写入时刻 millis()
+    uint8_t  basal_override_valid;      // 1 = 覆盖有效
+
+    // --- 基础率验证测试 (一次性打出全天总量, 供用户对照电机行程核验) ---
+    uint8_t  basal_test_running;        // 1 = 测试注射进行中
+    uint32_t basal_test_units_x100;     // 本次测试目标总量 ×100
 } pump_runtime_state_t;
 
 // ============================================================
@@ -236,6 +276,7 @@ typedef enum {
     EVENT_TYPE_POWER_ON     = 0x0A,
     EVENT_TYPE_POWER_OFF    = 0x0B,
     EVENT_TYPE_CALIBRATE    = 0x0C,
+    EVENT_TYPE_BASAL_TEST   = 0x0D,   // 基础率验证测试 (一次性打出全天 24 段总量)
 } event_type_t;
 
 #pragma pack(push, 1)

@@ -44,32 +44,73 @@ extern "C" {
 #define DANA_OP_PASSKEY_REQ       0xD1u
 #define DANA_OP_PASSKEY_RET       0xD2u
 
-/* 命令层 opcode（单字节，Dana-i / DanaRS-v2 BLE） */
-#define DANA_CMD_STEP_BOLUS_START 0x4Au   // 步进大剂量开始
+/* ------------------------------------------------------------
+ * 命令层 opcode（单字节，Dana-i / DanaRS-v2 BLE）
+ * 名称与数值逐字对齐 AAPS `pump/danars/.../encryption/BleEncryption.java`。
+ *
+ * ⚠️ 血泪教训（2026-08-07）：0x20~0x24 曾被误当作老 DanaR 串口协议的
+ *    "固件版本 / 协议版本 / 产品信息 / 电池 / 运行模式"，实际在 DanaRS BLE 里是
+ *    SHIPPING_INFORMATION / PUMP_CHECK / USER_TIME_CHANGE_FLAG / ... 完全不同的语义。
+ *    错误的语义 + 过短的响应会让 AAPS 的 handleMessage() 数组越界抛异常，
+ *    异常发生在 setReceived() 之前 → isReceived 永远为 false →
+ *    BLEComm.sendMessage() 等 5 秒后走 disconnect("Reply not received")。
+ *    这正是"正在获取泵设置"约 6 秒后断开的根因。
+ * ------------------------------------------------------------ */
+#define DANA_CMD_INITIAL_SCREEN   0x02u   // 初始屏幕信息（状态查询）→ 17B
+#define DANA_CMD_SHIPPING_INFO    0x20u   // 序列号(10)+国家(3)+出厂日期(3) → 16B
+#define DANA_CMD_PUMP_CHECK       0x21u   // hwModel+protocol+productCode → 3B（productCode 必须 ≥2）
+#define DANA_CMD_USER_TIME_CHANGE 0x22u   // 用户改时间标志
+#define DANA_CMD_SET_USER_TIME_CHANGE_CLEAR 0x23u
+#define DANA_CMD_MORE_INFO        0x24u   // 更多信息（今日总量/最后大剂量等）
+#define DANA_CMD_SET_HISTORY_UPLOAD_MODE 0x25u
+#define DANA_CMD_DAILY_TOTAL      0x26u   // 今日总量查询 → 2B
+#define DANA_CMD_BOLUS_INFO       0x40u   // STEP_BOLUS_INFORMATION → 11B
 #define DANA_CMD_STEP_BOLUS_STOP  0x44u   // 大剂量停止
-#define DANA_CMD_APS_TBR          0xC1u   // APS 临时基础率（闭环专用）
+#define DANA_CMD_EXT_BOLUS        0x47u   // 方波大剂量
+#define DANA_CMD_SET_DUAL_BOLUS   0x48u   // 双波大剂量 SET_DUAL_BOLUS (DanaRS)。
+                                           // ⚠️ 逐字节核对: 0x48 真实语义是双波大剂量,
+                                           //    **绝非** CGM 血糖下行。CGM 走自定义通道 g_ch_cgm。
+#define DANA_CMD_EXT_BOLUS_CANCEL 0x49u   // 取消方波
+#define DANA_CMD_STEP_BOLUS_START 0x4Au   // 步进大剂量开始
+#define DANA_CMD_CALC_INFO        0x4Bu   // 大剂量计算器信息 → 14B
+#define DANA_CMD_CIR_CF_ARRAY     0x4Eu   // 非 24h CIR/CF 数组（hw<7 才用）
+#define DANA_CMD_SET_CIR_CF       0x4Fu
+#define DANA_CMD_BOLUS_OPTION     0x50u   // 方波开关 + 错过大剂量配置 → 19B
+#define DANA_CMD_SET_BOLUS_OPTION 0x51u
+#define DANA_CMD_24_CIR_CF_ARRAY  0x52u   // 24 小时 CIR/CF 数组 → 97B（hw≥7 必发）
+#define DANA_CMD_SET_24_CIR_CF    0x53u
 #define DANA_CMD_SET_TBR          0x60u   // 手动临时基础率
 #define DANA_CMD_CANCEL_TBR       0x62u   // 取消临时基础率
-#define DANA_CMD_EXT_BOLUS        0x47u   // 方波大剂量
-#define DANA_CMD_EXT_BOLUS_CANCEL 0x49u   // 取消方波
-#define DANA_CMD_INITIAL_SCREEN   0x02u   // 初始屏幕信息（状态查询）
-#define DANA_CMD_DAILY_TOTAL      0x26u   // 今日总量查询
-#define DANA_CMD_BOLUS_INFO       0x40u   // 大剂量进度查询
-#define DANA_CMD_SET_DUAL_BOLUS   0x48u   // 双波大剂量 SET_DUAL_BOLUS (DanaRS)。
-                                           // ⚠️ 经 git 克隆 AAPS master 逐字节核对: 0x48 真实语义是
-                                           //    双波大剂量, **绝非** CGM 血糖下行! AAPS 当前版本
-                                           //    (pump/danars) 并不发送 0x48, 也无 APS 下发实时血糖的命令。
-                                           //    本教学原型未实现双波大剂量, 收到 0x48 走 default 返回 OK。
-                                           //    CGM 屏幕显示请走自定义 BLE 通道 g_ch_cgm (ble_comm.cpp)。
-#define DANA_CMD_GET_TIME         0x70u   // 读取泵时间
-#define DANA_CMD_SET_TIME         0x71u   // 设置泵时间
+#define DANA_CMD_PROFILE_NUMBER   0x63u   // 当前基础率方案号 → 1B
+#define DANA_CMD_SET_PROFILE_NUMBER 0x64u
+#define DANA_CMD_GET_PROFILE_BASAL  0x65u // 指定方案 24 段基础率 → 48B
+#define DANA_CMD_SET_PROFILE_BASAL  0x66u
+#define DANA_CMD_BASAL_RATE       0x67u   // maxBasal+basalStep+24 段 → 51B（basalStep 必须=1，即 0.01U）
+#define DANA_CMD_SET_BASAL_RATE   0x68u
+#define DANA_CMD_GET_TIME         0x70u   // 读取泵时间（本地时区）→ 6B
+#define DANA_CMD_SET_TIME         0x71u   // 设置泵时间（本地时区）
+#define DANA_CMD_USER_OPTION      0x72u   // 用户选项 → 20B（lcdOnTimeSec 必须 ≥5）
+#define DANA_CMD_SET_USER_OPTION  0x73u
+#define DANA_CMD_GET_UTC_TZ       0x78u   // 读取泵 UTC 时间 + 时区偏移 → 7B（hw≥7 走这条）
+#define DANA_CMD_SET_UTC_TZ       0x79u   // 设置泵 UTC 时间 + 时区偏移
+#define DANA_CMD_APS_TBR          0xC1u   // APS 临时基础率（闭环专用）
+#define DANA_CMD_APS_HISTORY_EVENTS 0xC2u // APS 历史事件（必须以 0xFF 结束，否则 AAPS 死等）
+#define DANA_CMD_APS_SET_EVENT_HISTORY 0xC3u
+#define DANA_CMD_SET_HISTORY_SAVE 0xE0u
+#define DANA_CMD_KEEP_CONNECTION  0xFFu   // 保活（data[0] 必须为 0）
 
 /* 通知 opcode（TYPE = NOTIFY） */
 #define DANA_NOTIFY_DELIVERY_COMPLETE 0x01u   // 大剂量结束
 #define DANA_NOTIFY_DELIVERY_RATE     0x02u   // 大剂量进度（已输注量）
 #define DANA_NOTIFY_ALARM             0x03u   // 报警
 
-#define DANA_MAX_PACKET      64u     // 单包最大字节（含信封）
+/* 单包最大字节（含信封 9B）。
+ * ⚠️ 必须 ≥ 106：0x52 (24_CIR_CF_ARRAY) 响应参数区就有 97B，9+97=106。
+ *    原值 64 会让 dana_build_packet() 直接返回 -1 → 泵一个字节都不发 →
+ *    AAPS 5 秒超时 disconnect。AAPS 侧 readBuffer 为 1024B，且
+ *    BLEComm 的 length = readBuffer[2].toInt() 是**有符号** Byte，
+ *    因此 LEN 必须 < 128 → 参数区上限 121B，128 的上限刚好安全。 */
+#define DANA_MAX_PACKET      128u
 #define DANA_MTU_CHUNK       20u     // BLE 写/通知分包每片上限
 
 /* ============================================================
@@ -155,11 +196,11 @@ int dana_unpack_packet(dana_ctx_t *c, const uint8_t *in, size_t in_len,
 /* ============================================================
  * 握手响应构造（握手阶段，不做二级加密）
  * ============================================================ */
-/* PUMP_CHECK 响应：解密后 14B = [0x02][0x00]['O']['K'][?][HW_MODEL][?][PROTOCOL][key×6]
+/* PUMP_CHECK 响应：解密后 14B = [0x01][0x00]['O']['K'][?][HW_MODEL][?][PROTOCOL][key×6]
  * AAPS processConnectResponse 据此判 hwModel∈{0x09,0x0A} 后发 TIME_INFORMATION。 */
 int dana_build_pump_check_response(dana_ctx_t *c, uint8_t *out, size_t *out_len);
 
-/* TIME_INFORMATION 响应：解密后 4B = [0x02][0x01]['O']['K']。
+/* TIME_INFORMATION 响应：解密后 4B = [0x01][0x01]['O']['K']。
  * AAPS processEncryptionResponse(BLE5) 收到即置 isConnected=true → 握手完成。 */
 int dana_build_time_info_response(dana_ctx_t *c, uint8_t *out, size_t *out_len);
 
@@ -183,6 +224,20 @@ void aaps_dana_attach(void *server);
  * 返回响应包是否成功入队发送。 */
 int aaps_dana_handle_command(dana_ctx_t *c, uint8_t opcode,
                              const uint8_t *params, size_t nparams);
+
+/* 泵→手机主动通知 (命令阶段走 BLE5): 大剂量进度 / 完成 / 报警 (P1-6 / P1-7) */
+void aaps_dana_send_notify(uint8_t notify_opcode, const uint8_t *params, uint8_t nparams);
+/* 大剂量进度上报: 已输注量 (U×100) (DANA_NOTIFY_DELIVERY_RATE) */
+void aaps_notify_bolus_progress(uint16_t delivered_x100);
+/* 大剂量完成通知 (DANA_NOTIFY_DELIVERY_COMPLETE) */
+void aaps_notify_bolus_complete(void);
+/* 报警主动推送 (DANA_NOTIFY_ALARM) */
+void aaps_notify_alarm(uint8_t alarm_code);
+
+/* 异步发送泵：在 loop() 上下文调用，把 onWrite 入队的响应按 MTU 分包 notify 发出。
+ * 避免在 NimBLE 写回调内同步 notify 被栈丢弃（连上但 AAPS 永收不到响应、2 分钟超时断开的根因）。
+ * 需在 FFF1 已订阅后发送。 */
+void aaps_dana_pump(void);
 
 #ifdef __cplusplus
 }

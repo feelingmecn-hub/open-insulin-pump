@@ -8,6 +8,11 @@
 #define LV_CONF_INCLUDE_SIMPLE
 #endif
 
+/* LVGL 确认哨兵: 让 lv_conf_internal.h 识别本配置已加载 (消除 "failure to include" 提示) */
+#ifndef LV_CONF_H
+#define LV_CONF_H
+#endif
+
 /* 操作系统: LVGL 仅在 display_task 单线程访问, 无需内置 OS 锁 */
 #define LV_USE_OS           LV_OS_NONE
 

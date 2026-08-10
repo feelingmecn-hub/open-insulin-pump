@@ -1,5 +1,6 @@
 package com.openloop.pump.ui.history
 
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -45,11 +46,11 @@ fun HistoryScreen(viewModel: HistoryViewModel = hiltViewModel()) {
         }
 
         if (tab == 0) {
-            LazyColumn(modifier = Modifier.weight(1f), verticalArrangement = Arrangement(8.dp)) {
+            LazyColumn(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(treatments) { t ->
                     Card(modifier = Modifier.fillMaxWidth()) {
                         Column(modifier = Modifier.padding(12.dp)) {
-                            Text("${t.type}  %.2f U".format(t.units),
+                            Text("${t.type}  %.1f U".format(t.units),
                                 style = MaterialTheme.typography.bodyLarge)
                             Text(ts(t.timestamp) + (t.note?.let { " · $it" } ?: ""),
                                 style = MaterialTheme.typography.bodySmall)
@@ -58,7 +59,7 @@ fun HistoryScreen(viewModel: HistoryViewModel = hiltViewModel()) {
                 }
             }
         } else {
-            LazyColumn(modifier = Modifier.weight(1f), verticalArrangement = Arrangement(8.dp)) {
+            LazyColumn(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(glucose) { g ->
                     Card(modifier = Modifier.fillMaxWidth()) {
                         Text("${g.mgdl} mg/dL  ·  ${ts(g.timestamp)}",

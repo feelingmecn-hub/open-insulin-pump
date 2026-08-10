@@ -9,9 +9,12 @@
  *
  * ⚠️ 实验项目，禁止用于人体。
  */
+#include <Arduino.h>
 #include "aaps_dana.h"
 
 #include <string.h>
+#include <cstdlib>
+#include "basal_history.h"  // P2-10b: AAPS 接管记入基础率执行历史
 
 /* ============================================================
  * BLE5 二级加密查表（AAPS bleEncryptionMatrix，100 字节）
@@ -205,7 +208,9 @@ int dana_unpack_packet(dana_ctx_t *c, const uint8_t *in, size_t in_len,
     size_t n = (size_t)len - 2u;                 // 参数个数
     size_t copy = (n > params_cap) ? params_cap : n;
     for (size_t i = 0; i < copy; i++) out_params[i] = buf[5u + i];
-    *out_nparams = n;
+    /* ★ 必须回报**实际拷贝**长度而非原始长度：调用方只能安全访问 copy 个字节。
+     * 之前回报原始 n，配合 48B 的 params 数组，会让 0x53(96B) 的处理逻辑越界读栈。 */
+    *out_nparams = copy;
     return 0;
 }
 
@@ -233,9 +238,13 @@ int dana_parse_packet(dana_ctx_t *c, const uint8_t *in, size_t in_len,
  * ============================================================ */
 int dana_build_pump_check_response(dana_ctx_t *c, uint8_t *out, size_t *out_len)
 {
-    /* 解密后 14B = [0x02][0x00]['O']['K'][?][HW_MODEL][?][PROTOCOL][key×6] */
+    /* code 字段(明文偏移[2])=0x01 表示"已配对/已设置连接密码"，AAPS 据此跳过
+     * setConnectionPassword 流程直接发 TIME_INFORMATION。若置 0x00，AAPS 3.x 会进入
+     * 连接密码交换分支，而本教学原型未实现该命令(L660 忽略)→ AAPS 卡 ~120s 后断开。
+     * 偏移对齐依据：泵回 [ 'O']['K'][code][hwModel][0x00][protocol][key×6]，AAPS 解析出
+     * 型号=hwModel、协议=protocol、代码=code，与真机 UI 显示(09/0A/00)完全自洽。 */
     uint8_t params[12] = {
-        'O', 'K', 0x00, c->hw_model, 0x00, c->protocol,
+        'O', 'K', 0x01, c->hw_model, 0x00, c->protocol,
         c->ble5_key[0], c->ble5_key[1], c->ble5_key[2],
         c->ble5_key[3], c->ble5_key[4], c->ble5_key[5]
     };
@@ -260,29 +269,191 @@ int dana_build_time_info_response(dana_ctx_t *c, uint8_t *out, size_t *out_len)
 #include "pump_state.h"
 #include "motor_controller.h"
 #include "basal_scheduler.h"
+#include "ui_hal.h"      // bolus_kind_t (BOLUS_DUAL 等, 双波大剂量类型标记)
 #include "rtc_clock.h"   // 0x70/0x71 时间同步
+#include "storage.h"     // AAPS 下发的配置（0x64/0x66/0x53）持久化
 
-/* FFF0 / FFF1 / FFF2 服务与特征 UUID（标准 Dana BLE GATT） */
-static const uint8_t U_FFF0[16] = {0x00,0x00,0xff,0xf0, 0x00,0x00,0x10,0x00, 0x80,0x00, 0x00,0x80,0x5f,0x9b,0x34,0xfb};
-static const uint8_t U_FFF1[16] = {0x00,0x00,0xff,0xf1, 0x00,0x00,0x10,0x00, 0x80,0x00, 0x00,0x80,0x5f,0x9b,0x34,0xfb};
-static const uint8_t U_FFF2[16] = {0x00,0x00,0xff,0xf2, 0x00,0x00,0x10,0x00, 0x80,0x00, 0x00,0x80,0x5f,0x9b,0x34,0xfb};
+/* FFF0 / FFF1 / FFF2 服务与特征 UUID（标准 Dana BLE GATT）
+ * ⚠️ 血泪教训（2026-08-08）：绝对不要用 NimBLEUUID(const uint8_t*, 16) 配「大端手写数组」。
+ *   NimBLE 的 16 字节构造函数按 BLE 线序（小端 / LSB first）解析，把
+ *   {0x00,0x00,0xff,0xf0,...,0x34,0xfb} 解释成 UUID 后会整体翻转，实际注册出来的是
+ *   fb349b5f-8000-0080-0010-0000f0ff0000（已用 macOS bleak 连上泵枚举 GATT 证实）。
+ *   而 AAPS BLEComm.findCharacteristic() 是对 "0000fff1-0000-1000-8000-00805f9b34fb"
+ *   做**字符串精确匹配**，翻转后永远匹配不上 → 零 SUBSCRIBE → 永远"正在连接"。
+ *   正解：Dana 用的本就是 16-bit 蓝牙 SIG 短 UUID，直接用 uint16_t 构造，
+ *   NimBLE 会自动展开成标准 Base UUID，零字节序风险。 */
+#define DANA_UUID_FFF0  ((uint16_t)0xFFF0)
+#define DANA_UUID_FFF1  ((uint16_t)0xFFF1)
+#define DANA_UUID_FFF2  ((uint16_t)0xFFF2)
 
 static dana_ctx_t            g_dana_ctx;
 static NimBLECharacteristic *g_dana_fff1 = nullptr;
-static uint8_t               g_rxbuf[128];
+static bool g_fff1_subscribed = false;   // AAPS 写 CCC 使能 FFF1 notify 后置 true
+
+/* ★ 多连接定向投递 (2026-08-08 修复)：
+ * onConnect 里保持广播以支持「华为系统连接 + AAPS 连接」并存（NimBLE 最多 3 连接）。
+ * 但此前 notify() 不带 connHandle → NimBLE 默认广播给**所有**已订阅连接；同时
+ * onDisconnect 无条件重置握手状态机。后果：
+ *   ① AAPS 发 PUMP_CHECK 后泵的响应可能被投到系统那条连接 → AAPS 收不到 → 30s 超时；
+ *   ② 系统那条连接抖动断开，会把 AAPS 正在进行的握手状态机一起清掉。
+ * 修复：记录「实际在跑 Dana 协议的那条连接」(写 FFF2 / 订阅 FFF1 的 peer)，
+ *       notify 定向发给它；只有它断开才重置握手状态机。
+ * 为 NONE 时退化为旧行为（发给所有订阅者），保证首包/兜底不丢。 */
+static uint16_t g_dana_peer_conn = BLE_HS_CONN_HANDLE_NONE;
+
+/* ★ AAPS 配置写入持久化 (2026-08-08)：
+ * AAPS「设置配置文件」会连发 0x64(方案号) / 0x66(24 段基础率) / 0x53(24×CIR+24×CF)。
+ * 此前泵只回 OK 不落盘 → 下次连接读回的还是旧值，AAPS 判定 profile 不一致，
+ * 于是「设置配置文件」按钮反复出现，且闭环用的 CIR/ISF 与手机不同步。
+ * 落盘走 Preferences(NVS)，单次可能阻塞几十 ms —— 绝不能在 BLE onWrite 回调内做
+ * （与 dana_trace flash 擦除同样的教训）。这里只置 dirty，由 loop 上下文的
+ * aaps_dana_pump() 合并延迟写入（连发三条命令合并为一次 NVS 写）。 */
+static volatile bool     g_dana_cfg_dirty = false;
+static volatile uint32_t g_dana_cfg_dirty_ms = 0;
+#define DANA_CFG_SAVE_DELAY_MS 1500u
+
+static inline void dana_cfg_mark_dirty(void)
+{
+    g_dana_cfg_dirty    = true;
+    g_dana_cfg_dirty_ms = (uint32_t)millis();
+}
+
+/* 异步发送队列：onWrite 回调只入队，aaps_dana_pump() 在 loop 上下文按 MTU 分包 notify。
+ * 原因：NimBLE 在 onWrite 的 GAP 事件回调内同步调用 characteristic->notify() 会被栈丢弃
+ *       （ATT 通知不能在接收事件处理中并发发起），这是"连上但 AAPS 永远收不到响应、
+ *       2 分钟超时断开"的根因。改为异步后，响应在事件循环空闲时发出即可送达。 */
+#define DANA_TXQ_SLOTS 8
+static uint8_t g_txq[DANA_TXQ_SLOTS][DANA_MAX_PACKET];
+static size_t  g_txq_len[DANA_TXQ_SLOTS];
+static int     g_txq_head = 0, g_txq_tail = 0;
+static bool    g_txq_full = false;
+/* 收包重组缓冲：最长的写入命令 0x53 = 96B 参数 → 整包 105B，分 6 片到达。
+ * 128B 时「未完成的 105B 包 + 下一片 20B」会触发溢出保护丢整包，故扩到 256B。 */
+static uint8_t               g_rxbuf[256];
 static size_t                g_rxlen = 0;
+static uint32_t              g_dana_passkey = 0;   // 蓝牙配对 passkey (= DANAI_BLE5_KEY)，Dana-i 要求系统层配对
+
+/* ===== BLE 握手追踪日志：存 flash(dana_trace 分区 0x3E0000/128KB)，boot 模式 esptool 导出 =====
+ * 定长 32B 记录 ring buffer： [ts:4][dir:1][op:1][len:1][st:1][data:24]
+ *   dir: 0=RX(手机→泵原始) 1=TX_ENQ(泵入队响应) 2=TX_SENT(泵实际notify) 3=STATUS 4=ERR
+ *   op : 命令 opcode（RX/TX 取包内[4]；STATUS 用约定值 0x00=PUMP_CHECK/0x01=TIME_INFO/0xFE=subscribe）
+ *   st : 子状态（STATUS: 1=收到; ERR: 错误码 r）
+ * 导出: esptool read_flash 0x3E0000 0x20000 dana_trace.bin  → 每 32B 解一条
+ *
+ * 主机联调构建(AAPS_DANA_HOST_TEST)没有 esp_flash/Preferences，也不需要 trace
+ * （主机侧断言直接看内存状态），故整块用空实现替换。 */
+#ifdef AAPS_DANA_HOST_TEST
+static bool g_trace_ready = true;
+static inline void dana_trace_init(void) {}
+static inline void dana_trace_log(uint8_t, uint8_t, uint8_t, const uint8_t *, uint8_t) {}
+#else
+#include <esp_flash.h>
+#include <Preferences.h>
+#define DANA_TRACE_ADDR   0x3E0000UL
+#define DANA_TRACE_SIZE   0x20000UL
+#define DANA_TRACE_MAGIC  0x44414E41UL   // "DANA"
+typedef struct { uint32_t ts; uint8_t dir; uint8_t op; uint8_t len; uint8_t st; uint8_t data[24]; } dana_trace_rec_t;
+static Preferences g_trace_nvs;
+static uint32_t    g_trace_off = 0;
+static int32_t     g_trace_lastsec = -1;
+static bool        g_trace_ready = false;
+
+static void dana_trace_init(void) {
+    g_trace_nvs.begin("dana", false);
+    g_trace_off = g_trace_nvs.getUInt("toff", 0);
+    uint32_t magic = 0;
+    if (esp_flash_read(esp_flash_default_chip, &magic, DANA_TRACE_ADDR, 4) != ESP_OK) magic = 0;
+    if (magic != DANA_TRACE_MAGIC) {                       // 首次使用：擦整区并写 magic
+        for (uint32_t s = 0; s < DANA_TRACE_SIZE; s += 4096)
+            esp_flash_erase_region(esp_flash_default_chip, DANA_TRACE_ADDR + s, 4096);
+        magic = DANA_TRACE_MAGIC;
+        esp_flash_write(esp_flash_default_chip, &magic, DANA_TRACE_ADDR, 4);
+        g_trace_off = 4;
+        g_trace_nvs.putUInt("toff", g_trace_off);
+    }
+    g_trace_lastsec = -1;
+    g_trace_ready = true;
+}
+
+static void dana_trace_log(uint8_t dir, uint8_t op, uint8_t st, const uint8_t *data, uint8_t len) {
+    if (!g_trace_ready) return;   // 未初始化(loop 尚未 init)则不记，避免 BLE 回调里擦 flash 阻塞握手
+    if (g_trace_off + sizeof(dana_trace_rec_t) > DANA_TRACE_ADDR + DANA_TRACE_SIZE) return;  // 满则停
+    dana_trace_rec_t r;
+    r.ts = (uint32_t)millis();
+    r.dir = dir; r.op = op; r.st = st;
+    r.len = (len > 24) ? 24 : len;
+    memset(r.data, 0, 24);
+    if (data && r.len) memcpy(r.data, data, r.len);
+    uint32_t phys = DANA_TRACE_ADDR + g_trace_off;
+    uint32_t sec = phys & ~0xFFFUL;
+    if ((int32_t)sec != g_trace_lastsec) {                 // 跨入新扇区则先擦（flash 不能覆写）
+        esp_flash_erase_region(esp_flash_default_chip, sec, 4096);
+        g_trace_lastsec = (int32_t)sec;
+    }
+    esp_flash_write(esp_flash_default_chip, &r, phys, sizeof(r));
+    g_trace_off += sizeof(r);
+    g_trace_nvs.putUInt("toff", g_trace_off);
+}
+#endif /* AAPS_DANA_HOST_TEST */
+
+/* 调试：十六进制打印收发字节（接 USB CDC 串口可见） */
+static void dana_dbg_hex(const char *tag, const uint8_t *d, size_t n) {
+    Serial.printf("[DANA] %s (%d): ", tag, (int)n);
+    for (size_t i = 0; i < n; i++) Serial.printf("%02X ", d[i]);
+    Serial.println();
+}
 
 /* 将已构建好的包（可能已二级加密）通过 FFF1 通知发出，>20B 自动分包 */
 static void dana_send_raw(const uint8_t *data, size_t len)
 {
     if (!g_dana_fff1) return;
-    size_t off = 0;
-    while (off < len) {
-        size_t chunk = len - off;
-        if (chunk > DANA_MTU_CHUNK) chunk = DANA_MTU_CHUNK;
-        g_dana_fff1->setValue(data + off, (uint16_t)chunk);
-        g_dana_fff1->notify();
-        off += chunk;
+    dana_dbg_hex("TX(enq)", data, len);
+    dana_trace_log(1, (len > 4 ? data[4] : 0), 0, data, (uint8_t)len);   // TX 入队（泵响应）
+    if (g_txq_full) { Serial.println("[DANA] TXQ full, drop"); return; }
+    int idx = g_txq_head;
+    size_t n = (len > DANA_MAX_PACKET) ? DANA_MAX_PACKET : len;
+    memcpy(g_txq[idx], data, n);
+    g_txq_len[idx] = n;
+    g_txq_head = (g_txq_head + 1) % DANA_TXQ_SLOTS;
+    if (g_txq_head == g_txq_tail) g_txq_full = true;
+}
+
+/* 在 loop() 上下文调用：把队列中的包按 MTU 分包 notify 发出（需 FFF1 已订阅或已连接）。 */
+void aaps_dana_pump(void)
+{
+    if (!g_dana_fff1) return;
+    if (!g_trace_ready) dana_trace_init();   // loop 空闲时初始化(含整区擦除)，不在 BLE 回调里阻塞
+    /* 订阅门控：AAPS 写 CCC 使能 FFF1 notify 后置 true；兜底——只要已建立 BLE 连接也发
+     * （防止 NimBLE onSubscribe 偶发不触发导致队列永不发、再次 2 分钟超时）。未订阅时
+     * notify 会被栈静默丢弃，无害。 */
+    if (!g_fff1_subscribed && !g_pump_state.ble_connected) return;
+    while (g_txq_head != g_txq_tail) {
+        int idx = g_txq_tail;
+        const uint8_t *data = g_txq[idx];
+        size_t len = g_txq_len[idx];
+        size_t off = 0;
+        while (off < len) {
+            size_t chunk = len - off;
+            if (chunk > DANA_MTU_CHUNK) chunk = DANA_MTU_CHUNK;
+            g_dana_fff1->setValue(data + off, (uint16_t)chunk);
+            /* ★ 定向投递给 Dana 协议对端（AAPS），避免多连接下发错连接。
+             * g_dana_peer_conn == BLE_HS_CONN_HANDLE_NONE 时等同旧行为(全体订阅者)。 */
+            g_dana_fff1->notify(data + off, chunk, g_dana_peer_conn);
+            dana_trace_log(2, (len > 4 ? data[4] : 0), 0, data + off, (uint8_t)chunk);  // TX 实际发出
+            off += chunk;
+        }
+        g_txq_tail = (g_txq_tail + 1) % DANA_TXQ_SLOTS;
+        g_txq_full = false;
+    }
+
+    /* AAPS 下发的配置延迟落盘：响应先发完（AAPS 有 5s 超时），再写 NVS。
+     * 延迟 1.5s 合并 0x64+0x66+0x53 连发，避免一次「设置配置文件」写三遍 flash。 */
+    if (g_dana_cfg_dirty &&
+        (uint32_t)(millis() - g_dana_cfg_dirty_ms) >= DANA_CFG_SAVE_DELAY_MS) {
+        g_dana_cfg_dirty = false;
+        storage_save_config(&g_pump_config);
+        Serial.println("[DANA] AAPS profile persisted to NVS");
+        dana_trace_log(3, 0xF9, 1, nullptr, 0);   // 配置落盘
     }
 }
 
@@ -302,37 +473,123 @@ void aaps_dana_send_notify(uint8_t notify_opcode, const uint8_t *params, uint8_t
     dana_send_packet(DANA_TYPE_NOTIFY, notify_opcode, params, nparams, 1);
 }
 
+/* ---- 大剂量进度/完成/报警主动推送 (P1-6 / P1-7) ----
+ * 由 motor_controller (大剂量分段打入时) 与 safety_monitor (报警触发时) 调用。
+ * g_dana_fff1 为 null (尚未发起 / 模拟器环境) 时 dana_send_raw 自动 no-op。 */
+void aaps_notify_bolus_progress(uint16_t delivered_x100)
+{
+    uint8_t p[2] = { (uint8_t)(delivered_x100 & 0xFF), (uint8_t)(delivered_x100 >> 8) };
+    aaps_dana_send_notify(DANA_NOTIFY_DELIVERY_RATE, p, 2);
+}
+
+/* ⚠️ DanaRSPacketNotifyDeliveryComplete.handleMessage 读的是 **2 字节**
+ *    (byteArrayToInt(getBytes(data, DATA_START, 2)) / 100.0 = 已输注 U)。
+ *    这里若只发 1 字节，AAPS 会数组越界抛异常 → 打药进度条卡死/连接异常。 */
+void aaps_notify_bolus_complete(void)
+{
+    uint16_t delivered = (uint16_t)(g_pump_state.bolus_delivered_x100 & 0xFFFF);
+    uint8_t p[2] = { (uint8_t)(delivered & 0xFF), (uint8_t)(delivered >> 8) };
+    aaps_dana_send_notify(DANA_NOTIFY_DELIVERY_COMPLETE, p, 2);
+}
+
+void aaps_notify_alarm(uint8_t alarm_code)
+{
+    uint8_t p[1] = { alarm_code };
+    aaps_dana_send_notify(DANA_NOTIFY_ALARM, p, 1);
+}
+
 /* ---- 0x48 CGM 误解析已移除 (2026-07-28) ----
  * 经 git 克隆 AAPS master (pump/danars) 逐字节核对: 0x48 真实语义是
  * SET_DUAL_BOLUS (双波大剂量), AAPS 不通过 DanaRS 协议下发实时 CGM 血糖。
  * CGM 屏幕显示请走自定义 BLE 通道 g_ch_cgm (ble_comm.cpp)。 */
 
-/* ---- DanaRS 0x71 设置泵时间 (AAPS → 泵) ----
- * 布局依据 DanaRS 协议 DanaRS_Packet_APS_Time:
- *   params[0] : 年 (year - 2000, 1 字节)
- *   params[1] : 月 (1-12)   params[2] : 日 (1-31)
- *   params[3] : 时 (0-23)   params[4] : 分 (0-59)  params[5] : 秒 (0-59)
- * ⚠️ 若你的 AAPS 版本发送 2 字节完整年或不同顺序, 请调整此处。 */
+/* ---- DanaRS 0x71 SET_PUMP_TIME (AAPS → 泵，本地时间) ----
+ *   params[0] : 年 (year - 2000)  [1] 月(1-12)  [2] 日(1-31)
+ *   params[3] : 时(0-23)          [4] 分(0-59)  [5] 秒(0-59)
+ * 泵内 RTC 存的就是「本地墙钟」，直接写入。 */
 static void dana_apply_time(const uint8_t *p, size_t n)
 {
     if (n < 6) return;
-    int y  = (int)p[0] + 2000;
-    int mo = (int)p[1];
-    int d  = (int)p[2];
-    int h  = (int)p[3];
-    int mi = (int)p[4];
-    int s  = (int)p[5];
-    uint32_t u = rtc_ymdhms_to_unix(y, mo, d, h, mi, s);
+    uint32_t u = rtc_ymdhms_to_unix((int)p[0] + 2000, (int)p[1], (int)p[2],
+                                    (int)p[3], (int)p[4], (int)p[5]);
     if (u != 0) rtc_set_unix(u);
 }
 
-/* 命令分发：构造命令响应并发送；打药动作接入既有 motor/basal 入口 */
+/* ============================================================
+ * 时间/时区：Dana-i (hwModel≥7) 走 0x78/0x79（UTC + 时区偏移）
+ * ------------------------------------------------------------
+ * AAPS 侧语义（逐字读 DanaRSPacketOptionGetPumpUTCAndTimeZone +
+ * DanaPump.setPumpTime(value, zoneOffset) 推导）：
+ *   1) 泵回 7B = UTC 的 [年-2000][月][日][时][分][秒][zoneOffset]
+ *   2) AAPS 用**手机本地时区**构造 DateTime(...)，得 millis = UTC_epoch - offset*3600
+ *   3) setPumpTime 再 +offset*3600 → pumpTime == 真实 UTC epoch
+ *   4) timeDiff = pumpTime - System.currentTimeMillis()
+ * ⇒ 泵必须返回**真正的 UTC** 年月日时分秒，否则 timeDiff 会整整差一个时区。
+ *
+ * ⚠️ 致命分支：|timeDiff| > 1.5 小时 → AAPS 弹「泵时间偏差过大」并
+ *    danaPump.reset() + return，**不会**自动下发 0x79 纠正，初始化直接失败。
+ *    因此 RTC 从未设置时必须给出一个「大致正确」的兜底值 —— 这里用固件
+ *    编译时间（__DATE__/__TIME__，即本机构建时的北京时间）。用户只要在
+ *    烧录后不久连接就能落进 1.5h 窗口，之后 AAPS 会用 0x79 精确校时。
+ * ============================================================ */
+static int8_t g_dana_zone_offset = 8;   /* 东八区默认；收到 0x79 后由手机覆盖 */
+
+/* 固件编译时刻（本地墙钟）→ unix 秒，作为 RTC 未设置时的兜底 */
+/* 泵内本地墙钟（unix 秒），RTC 未设置时回退到固件编译时刻。
+ * 编译时刻解析已上移到 rtc_clock.h::rtc_build_time_unix()（固件/模拟器共用，
+ * rtc_clock_init 的时间下界保护也用同一个值，避免两处实现漂移）。 */
+static uint32_t dana_local_now(void)
+{
+    uint32_t u = rtc_unix_now();
+    return u ? u : rtc_build_time_unix();
+}
+
+/* LSB-first 写 16 位（Dana 参数区一律小端） */
+static inline void dana_put16(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)(v & 0xFF);
+    p[1] = (uint8_t)(v >> 8);
+}
+
+/* float U → U×100 的 uint16（四舍五入 + 饱和） */
+static inline uint16_t dana_u100(float u)
+{
+    if (u <= 0.0f) return 0;
+    float v = u * 100.0f + 0.5f;
+    return (v > 65535.0f) ? 65535u : (uint16_t)v;
+}
+
+/* ============================================================
+ * 命令分发：构造命令响应并发送；打药动作接入既有 motor/basal 入口
+ * ------------------------------------------------------------
+ * ⚠️ 断连根因（2026-08-07 定位，务必牢记）：
+ *   AAPS `BLEComm.processMessage()` 的顺序是
+ *       message.handleMessage(decryptedBuffer)   ← 先解析
+ *       message.setReceived()                    ← 后置「已收到」
+ *   一旦 handleMessage 因响应过短而数组越界抛异常，setReceived() 永远不会执行，
+ *   `BLEComm.sendMessage()` 里 `message.waitMillis(5000)` 超时后就走
+ *       disconnect("Reply not received")
+ *   —— 表现就是「正在获取泵设置」约 5~6 秒后断开、无限重连。
+ *   所以**每个 opcode 的参数区长度必须 ≥ AAPS 解析器读取的字节数**，
+ *   未知命令也要回足够长的零填充，绝不能只回 1 字节。
+ *
+ * AAPS 3.2.x 初始化序列（DanaRSService.readPumpStatus，hwModel=0x09 ⇒
+ * usingUTC=true / profile24=true）：
+ *   0xFF → 0x20 → 0x21 → 0x63 → 0x50 → 0x67 → 0x4B → 0x52 → 0x72
+ *        → 0x02 → 0x40 → 0x78 [→ 0x79 → 0x78] → 0xC2(loadEvents) → 0x02
+ * ============================================================ */
 int aaps_dana_handle_command(dana_ctx_t *c, uint8_t opcode,
                              const uint8_t *params, size_t nparams)
 {
-    uint8_t resp[18];
-    uint8_t rn = 1;
-    resp[0] = 0x00;  // 默认 OK
+    /* 最长响应 = 0x52 的 97B 参数区 */
+    uint8_t resp[104];
+    memset(resp, 0, sizeof(resp));
+    uint8_t rn = 1;                 // 默认 1B 结果码 0x00 = OK
+
+    /* 当前小时（用于取当日 CIR/CF/目标），RTC 未设置时退化到 0 点 */
+    int cy, cmo, cd, ch, cmi, cs;
+    rtc_unix_to_ymdhms(dana_local_now(), &cy, &cmo, &cd, &ch, &cmi, &cs);
+    const uint8_t prof = (uint8_t)(g_pump_config.active_profile & (MAX_BASAL_PROFILES - 1));
 
     switch (opcode) {
         case DANA_CMD_STEP_BOLUS_START: {  /* 0x4A 步进大剂量 */
@@ -383,56 +640,381 @@ int aaps_dana_handle_command(dana_ctx_t *c, uint8_t opcode,
             basal_scheduler_cancel_extended_bolus();
             break;
 
-        case DANA_CMD_INITIAL_SCREEN: {  /* 0x02 状态查询（17B） */
-            uint16_t daily = (uint16_t)(g_pump_state.today_units_x100 & 0xFFFF);
-            uint16_t maxd  = (uint16_t)(RESERVOIR_CAPACITY_U * 100u);
-            uint16_t resv  = (uint16_t)(g_pump_state.reservoir_units_left * 100u);
-            uint16_t basal = (uint16_t)(g_pump_state.current_basal_rate * 100.0f);
-            uint16_t iob   = (uint16_t)(g_pump_state.iob_x10000 / 100u);
-            resp[0] = 0x00;                                  // status: 未暂停/无 TBR 标志位
-            resp[1] = (uint8_t)(daily & 0xFF); resp[2] = (uint8_t)(daily >> 8);
-            resp[3] = (uint8_t)(maxd & 0xFF);  resp[4] = (uint8_t)(maxd >> 8);
-            resp[5] = (uint8_t)(resv & 0xFF);  resp[6] = (uint8_t)(resv >> 8);
-            resp[7] = (uint8_t)(basal & 0xFF); resp[8] = (uint8_t)(basal >> 8);
-            resp[9] = (uint8_t)g_pump_state.tbr_percent;
+        /* ---- 0x02 INITIAL_SCREEN_INFORMATION → 17B（protocol≥10 读到 [15]） ----
+         * status 位：bit0=暂停 bit2=方波中 bit3=双波中 bit4=TBR 中 */
+        case DANA_CMD_INITIAL_SCREEN: {
+            uint8_t status = 0;
+            if (g_pump_state.tbr_percent > 0.0f)      status |= 0x10;
+            if (basal_scheduler_extended_bolus_active()) status |= 0x04;
+            resp[0]  = status;
+            dana_put16(&resp[1],  (uint16_t)(g_pump_state.today_units_x100 & 0xFFFF)); // 今日总量 U×100
+            dana_put16(&resp[3],  (uint16_t)(RESERVOIR_CAPACITY_U * 100u));            // 每日上限 U×100
+            dana_put16(&resp[5],  dana_u100(g_pump_state.reservoir_units_left));       // 余量 U×100
+            dana_put16(&resp[7],  dana_u100(g_pump_state.current_basal_rate));         // 当前基础率 U/h×100
+            resp[9]  = (uint8_t)g_pump_state.tbr_percent;
             resp[10] = g_pump_state.battery_pct;
-            resp[11] = 0x00; resp[12] = 0x00;               // 方波绝对速率（简化）
-            resp[13] = (uint8_t)(iob & 0xFF); resp[14] = (uint8_t)(iob >> 8);
-            resp[15] = 0x00;                                 // 错误状态
-            resp[16] = 0x00;                                 // 保留
+            dana_put16(&resp[11], dana_u100(g_pump_state.tbr_rate));                   // 方波绝对速率（近似）
+            dana_put16(&resp[13], (uint16_t)(g_pump_state.iob_x10000 / 100u));         // IOB U×100
+            resp[15] = 0x00;                                                            // errorState = NONE
+            resp[16] = 0x00;
             rn = 17;
             break;
         }
-        case DANA_CMD_DAILY_TOTAL: {     /* 0x26 今日总量（2B） */
-            uint16_t daily = (uint16_t)(g_pump_state.today_units_x100 & 0xFFFF);
-            resp[0] = (uint8_t)(daily & 0xFF); resp[1] = (uint8_t)(daily >> 8);
+
+        /* ---- 0x26 REVIEW__GET_TODAY_DELIVERY_TOTAL → 2B ---- */
+        case DANA_CMD_DAILY_TOTAL:
+            dana_put16(&resp[0], (uint16_t)(g_pump_state.today_units_x100 & 0xFFFF));
             rn = 2;
             break;
+
+        /* ---- 0x40 BOLUS__GET_STEP_BOLUS_INFORMATION → 11B ----
+         * [0]error [1]bolusType [2..3]initialBolusAmount×100 [4]hour [5]min
+         * [6..7]lastBolusAmount×100 [8..9]maxBolus×100 [10]bolusStep×100
+         * ⚠️ 旧实现只回 3B（被误当成「大剂量进度查询」），AAPS 读到 [10] 必越界。
+         *    bolusStep 上报 10 = 0.1U —— 与本机可靠最小剂量一致（剂量诚实性原则），
+         *    AAPS 会据此把下发剂量对齐到 0.1U 栅格。 */
+        case DANA_CMD_BOLUS_INFO: {
+            uint16_t last = (uint16_t)(g_pump_state.bolus_delivered_x100 & 0xFFFF);
+            resp[0] = 0x00;                                   // error = 0（非 0 会 failed）
+            resp[1] = motor_bolus_active() ? 0x01 : 0x00;     // bolusType
+            dana_put16(&resp[2], last);                       // initialBolusAmount
+            resp[4] = (uint8_t)ch;                            // 最后一次大剂量时刻（时）
+            resp[5] = (uint8_t)cmi;                           //                    （分）
+            dana_put16(&resp[6], last);                       // lastBolusAmount
+            dana_put16(&resp[8], dana_u100(g_pump_config.max_bolus_single));
+            resp[10] = 10;                                    // bolusStep = 0.10U
+            rn = 11;
+            break;
         }
-        case DANA_CMD_BOLUS_INFO:        /* 0x40 大剂量进度 */
+
+        case DANA_CMD_SET_DUAL_BOLUS:    /* 0x48 双波大剂量 SET_DUAL_BOLUS (DanaRS)
+                                          * 布局 (与 AAPS DanaRS_Packet_APS_Set_Dual_Bolus 一致):
+                                          *   params[0..1]: 立即量 (U×100, 2B)
+                                          *   params[2..3]: 延展量 (U×100, 2B)
+                                          *   params[4]   : 时长 (30 分钟单位, 1-16 → 0.5-8h)
+                                          * 立即量走一笔常规大剂量 (motor), 延展量交给
+                                          * basal_scheduler 按 duration 时间维铺开 (与方波同机制)。 */
+            if (nparams >= 5) {
+                uint16_t imme = (uint16_t)(params[0] | ((uint16_t)params[1] << 8));
+                uint16_t ext  = (uint16_t)(params[2] | ((uint16_t)params[3] << 8));
+                uint8_t  halfHours = params[4];
+                float duration_h = (float)halfHours * 0.5f;
+                if (imme > 0) {
+                    motor_command_t cmd{};
+                    cmd.type = MOTOR_CMD_BOLUS;
+                    cmd.units_x100 = imme;
+                    cmd.kind = BOLUS_DUAL;
+                    motor_enqueue(&cmd);
+                }
+                if (ext > 0) {
+                    basal_scheduler_start_extended_bolus((float)ext / 100.0f, duration_h, BOLUS_DUAL);
+                }
+            }
             break;
 
-        case DANA_CMD_SET_DUAL_BOLUS:    /* 0x48 双波大剂量: 教学原型未实现, 返回 OK */
-            break;
-
-        case DANA_CMD_SET_TIME:          /* 0x71 AAPS 下发时间同步 */
+        case DANA_CMD_SET_TIME:          /* 0x71 AAPS 下发时间同步（本地时区，6B） */
             dana_apply_time(params, nparams);
+            resp[0] = 0x00;              // result = OK
+            rn = 1;
             break;
 
-        case DANA_CMD_GET_TIME: {        /* 0x70 AAPS 读取泵时间 */
-            uint32_t u = rtc_unix_now();
-            int y, mo, d, h, mi, s;
-            if (u == 0) { y = 2000; mo = 1; d = 1; h = 0; mi = 0; s = 0; }
-            else rtc_unix_to_ymdhms(u, &y, &mo, &d, &h, &mi, &s);
-            resp[0] = (uint8_t)(y - 2000);
-            resp[1] = (uint8_t)mo; resp[2] = (uint8_t)d;
-            resp[3] = (uint8_t)h;  resp[4] = (uint8_t)mi; resp[5] = (uint8_t)s;
+        case DANA_CMD_GET_TIME: {        /* 0x70 AAPS 读取泵时间（本地时区）→ 6B */
+            resp[0] = (uint8_t)(cy - 2000);
+            resp[1] = (uint8_t)cmo; resp[2] = (uint8_t)cd;
+            resp[3] = (uint8_t)ch;  resp[4] = (uint8_t)cmi; resp[5] = (uint8_t)cs;
             rn = 6;
             break;
         }
-        default:
-            /* 其余未识别命令: 教学原型返回 OK */
+
+        /* ---- 0x78 OPTION__GET_PUMP_UTC_AND_TIME_ZONE → 7B ----
+         * AAPS: DateTime(2000+y, m, d, h, mi, s) 用**手机本地时区**解释，
+         *       再 setPumpTime(millis, zoneOffset) 加回 offset → 得到真实 UTC。
+         * ⇒ 这里必须回 **UTC 墙钟**，而不是本地墙钟。
+         * ⚠️ month/day 为 0 会让 Joda DateTime 抛 IllegalFieldValueException，
+         *    进而 setReceived() 不执行 → 5 秒超时断开。dana_local_now() 保证有效。 */
+        case DANA_CMD_GET_UTC_TZ: {
+            int32_t  off_s = (int32_t)g_dana_zone_offset * 3600;
+            uint32_t utc   = dana_local_now();
+            utc = (off_s >= 0 || utc > (uint32_t)(-off_s)) ? (uint32_t)((int32_t)utc - off_s) : 0;
+            int y, mo, d, h, mi, s;
+            rtc_unix_to_ymdhms(utc, &y, &mo, &d, &h, &mi, &s);
+            resp[0] = (uint8_t)(y - 2000);
+            resp[1] = (uint8_t)mo; resp[2] = (uint8_t)d;
+            resp[3] = (uint8_t)h;  resp[4] = (uint8_t)mi; resp[5] = (uint8_t)s;
+            resp[6] = (uint8_t)(int8_t)g_dana_zone_offset;   // 有符号小时
+            rn = 7;
+            break;
+        }
+
+        /* ---- 0x79 OPTION__SET_PUMP_UTC_AND_TIME_ZONE ← 7B（UTC + 时区）----
+         * 泵内 RTC 存本地墙钟 = UTC + offset*3600。响应 1B result。 */
+        case DANA_CMD_SET_UTC_TZ: {
+            if (nparams >= 7) {
+                uint32_t utc = rtc_ymdhms_to_unix((int)params[0] + 2000, (int)params[1], (int)params[2],
+                                                  (int)params[3], (int)params[4], (int)params[5]);
+                int8_t off = (int8_t)params[6];
+                g_dana_zone_offset = off;
+                if (utc != 0) rtc_set_unix((uint32_t)((int32_t)utc + (int32_t)off * 3600));
+            }
+            resp[0] = 0x00;
             rn = 1;
+            break;
+        }
+
+        /* ---- 0xFF ETC__KEEP_CONNECTION → 1B（0 = OK，非 0 会 failed）---- */
+        case DANA_CMD_KEEP_CONNECTION:
+            resp[0] = 0x00;
+            rn = 1;
+            break;
+
+        /* ---- 0x20 REVIEW__GET_SHIPPING_INFORMATION → 16B ----
+         * [0..9] 序列号(ASCII,10) [10..12] 国家(ASCII,3) [13..15] 出厂日期(年-2000,月,日)
+         * ⚠️ 日期走 Joda DateTime(y, month, day, 0, 0)：month/day 必须 1..12 / 1..31，
+         *    否则抛异常 → AAPS 5 秒超时断开。绝不能留 0。 */
+        case DANA_CMD_SHIPPING_INFO: {
+            const char *sn = DANAI_DEVICE_NAME;              // "DAN12345AB"，正好 10 字符
+            for (int i = 0; i < 10; i++) resp[i] = sn[i] ? (uint8_t)sn[i] : (uint8_t)'0';
+            resp[10] = 'K'; resp[11] = 'O'; resp[12] = 'R';  // shippingCountry
+            resp[13] = 26; resp[14] = 1; resp[15] = 1;       // 2026-01-01（合法即可）
+            rn = 16;
+            break;
+        }
+
+        /* ---- 0x21 REVIEW__GET_PUMP_CHECK → 3B ----
+         * [0] hwModel（0x09 → PumpType.DANA_I，且 usingUTC/profile24 = true）
+         * [1] protocol（≥10 → InitialScreen 读 errorState）
+         * [2] productCode（<2 会弹 UNSUPPORTED_FIRMWARE 通知） */
+        case DANA_CMD_PUMP_CHECK:
+            resp[0] = (uint8_t)DANAI_HW_MODEL;
+            resp[1] = (uint8_t)DANAI_PROTOCOL;
+            resp[2] = 0x02;
+            rn = 3;
+            break;
+
+        /* ---- 0x22 REVIEW__GET_USER_TIME_CHANGE_FLAG → 1B（data.size<3 会 failed）---- */
+        case DANA_CMD_USER_TIME_CHANGE:
+            resp[0] = 0x00;
+            rn = 1;
+            break;
+
+        /* ---- 0x63 BASAL__GET_PROFILE_NUMBER → 1B ----
+         * ⚠️ 这个值会被 0x67 用作 pumpProfiles 的行下标，AAPS 数组只有 4 行，必须 0..3。 */
+        case DANA_CMD_PROFILE_NUMBER:
+            resp[0] = prof;
+            rn = 1;
+            break;
+
+        /* ---- 0x64 BASAL__SET_PROFILE_NUMBER ← 1B ---- */
+        case DANA_CMD_SET_PROFILE_NUMBER:
+            if (nparams >= 1 && params[0] < MAX_BASAL_PROFILES &&
+                g_pump_config.active_profile != params[0]) {
+                g_pump_config.active_profile = params[0];
+                dana_cfg_mark_dirty();
+                Serial.printf("[DANA] 0x64 active_profile=%u\n", (unsigned)params[0]);
+            }
+            resp[0] = 0x00;
+            rn = 1;
+            break;
+
+        /* ---- 0x50 BOLUS__GET_BOLUS_OPTION → 19B ----
+         * [0] isExtendedBolusEnabled（**必须 == 1**，否则 EXTENDED_BOLUS_DISABLED + failed）
+         * [1] bolusCalculationOption [2] missedBolusConfig [3..18] 4 组错过大剂量时段 */
+        case DANA_CMD_BOLUS_OPTION:
+            resp[0] = 0x01;      // 方波使能（AAPS 强制要求）
+            resp[1] = 0x01;      // 大剂量计算器可用
+            resp[2] = 0x00;      // 错过大剂量提醒关闭 → 后面 16B 全 0 即可
+            rn = 19;
+            break;
+
+        /* ---- 0x67 BASAL__GET_BASAL_RATE → 51B ----
+         * [0..1] maxBasal×100  [2] basalStep×100（**必须 == 1**，即 0.01U，
+         *        否则 WRONG_BASAL_STEP + failed）  [3..50] 24 段基础率×100
+         * 注：basalStep 只是 AAPS 用来做 UI 取整/合法性校验的「协议档位」，
+         *     实际下发到电机仍走 dosing.h 的 0.1U 栅格（剂量诚实性原则）。 */
+        case DANA_CMD_BASAL_RATE: {
+            /* maxBasal 回 0 会让 AAPS 认为泵不允许任何基础率 → 配置文件永远校验失败。
+             * 与 0x66 的写入钳制用同一个兜底值，保证读写口径一致。 */
+            float maxb = g_pump_config.max_basal_per_hour;
+            if (!(maxb > 0.0f)) maxb = MAX_BASAL_RATE;
+            dana_put16(&resp[0], dana_u100(maxb));
+            resp[2] = 1;                                     // 0.01 U
+            for (int i = 0; i < 24; i++)
+                dana_put16(&resp[3 + i * 2],
+                           dana_u100(g_pump_config.profiles[prof].slots[i].rate_uh));
+            rn = 51;
+            break;
+        }
+
+        case DANA_CMD_GET_PROFILE_BASAL: {     /* 0x65 指定方案 24 段 → 48B */
+            uint8_t q = (nparams >= 1 && params[0] < MAX_BASAL_PROFILES) ? params[0] : prof;
+            for (int i = 0; i < 24; i++)
+                dana_put16(&resp[i * 2], dana_u100(g_pump_config.profiles[q].slots[i].rate_uh));
+            rn = 48;
+            break;
+        }
+
+        /* ---- 0x4B BOLUS__GET_CALCULATION_INFORMATION → 14B ----
+         * [0]error(≠0→failed) [1..2]BG [3..4]碳水 [5..6]目标 [7..8]CIR [9..10]CF
+         * [11..12]IOB×100 [13]units（0=mg/dL；若报 1=mmol 则 CF/目标/BG 会被 ÷100） */
+        case DANA_CMD_CALC_INFO: {
+            resp[0] = 0x00;
+            dana_put16(&resp[1],  g_pump_state.last_glucose_mgdl);
+            dana_put16(&resp[3],  0);
+            dana_put16(&resp[5],  g_pump_config.target_glucose[ch]);
+            dana_put16(&resp[7],  (uint16_t)(g_pump_config.carb_ratio[ch] + 0.5f));
+            dana_put16(&resp[9],  (uint16_t)(g_pump_config.isf[ch] + 0.5f));
+            dana_put16(&resp[11], (uint16_t)(g_pump_state.iob_x10000 / 100u));
+            resp[13] = 0x00;     // UNITS_MGDL
+            rn = 14;
+            break;
+        }
+
+        /* ---- 0x52 BOLUS__GET_24_CIR_CF_ARRAY → 97B（hwModel≥7 走这条）----
+         * [0]units  [1..48] 24×CIR(2B)  [49..96] 24×CF(2B)
+         * units 必须 ∈ {0,1}，否则 failed。这是最长的一包 → DANA_MAX_PACKET 必须 ≥106。 */
+        case DANA_CMD_24_CIR_CF_ARRAY: {
+            resp[0] = 0x00;      // MGDL
+            for (int i = 0; i < 24; i++) {
+                dana_put16(&resp[1 + i * 2],      (uint16_t)(g_pump_config.carb_ratio[i] + 0.5f));
+                dana_put16(&resp[1 + 48 + i * 2], (uint16_t)(g_pump_config.isf[i] + 0.5f));
+            }
+            rn = 97;
+            break;
+        }
+
+        /* ---- 0x4E BOLUS__GET_CIR_CF_ARRAY（hw<7 分支）----
+         * 本机 hwModel=0x09 ≥7 ⇒ profile24=true，AAPS 只会发 0x52，这条走不到。
+         * 但真要收到，它顺序读 language(1)+units(1)+12×CIR(2B)+12×CF(2B) ≈ 50B，
+         * 32B 会越界 → 5 秒断连。给 64B 零填充留足余量。 */
+        case DANA_CMD_CIR_CF_ARRAY:
+            rn = 64;
+            break;
+
+        /* ---- 0x72 OPTION__GET_USER_OPTION → 20B ----
+         * [0]timeDisplayType(0=24h) [1]buttonScroll [2]beepAndAlarm
+         * [3]lcdOnTimeSec（**必须 ≥5**，否则 failed！） [4]backlight [5]language
+         * [6]units(0=mg/dL) [7]shutdownHour [8]lowReservoirRate
+         * [9..10]cannulaVolume [11..12]refillAmount [13..17]可选语言 [18..19]target
+         * data.size≥22（=20B 参数）时才读 target，所以固定回 20B。 */
+        case DANA_CMD_USER_OPTION:
+            resp[0]  = 0x00;                 // 24 小时制
+            resp[1]  = 0x00;                 // 按键滚动关
+            resp[2]  = 0x01;                 // 蜂鸣
+            resp[3]  = 30;                   // LCD 常亮 30s（≥5）
+            resp[4]  = 30;                   // 背光 30s
+            resp[5]  = 0x01;                 // 语言
+            resp[6]  = 0x00;                 // MGDL
+            resp[7]  = 0x00;                 // 不自动关机
+            resp[8]  = 20;                   // 低药量阈值 20U
+            dana_put16(&resp[9],  0);        // cannulaVolume
+            dana_put16(&resp[11], (uint16_t)RESERVOIR_CAPACITY_U);   // refillAmount
+            dana_put16(&resp[18], 100);      // target 100 mg/dL
+            rn = 20;
+            break;
+
+        /* ---- 0x66 BASAL__SET_PROFILE_BASAL_RATE ← 49B ----
+         * [0] profileNumber  [1..48] 24 段基础率 ×100（小端 2B/段）
+         * 必须真正落盘：AAPS 每次连接都用 0x67/0x65 读回比对，不一致就一直提示
+         * 「设置配置文件」；而且泵本地的 basal_scheduler 直接读 g_pump_config，
+         * 不写入就等于 AAPS 的配置文件根本没生效（闭环基础率错的）。 */
+        case DANA_CMD_SET_PROFILE_BASAL: {
+            if (nparams >= 49) {
+                uint8_t q = (params[0] < MAX_BASAL_PROFILES) ? params[0] : prof;
+                bool changed = false;
+                /* ⚠️ 钳制上限必须有安全兜底：若 g_pump_config.max_basal_per_hour 为 0
+                 * （旧版 NVS 结构、首次上电未初始化等），直接用它当上限会把 AAPS 下发的
+                 * 24 段基础率**全部钳成 0** → 泵完全不给基础率。主机联调实测踩到过。 */
+                float cap = g_pump_config.max_basal_per_hour;
+                if (!(cap > 0.0f)) cap = MAX_BASAL_RATE;
+                for (int i = 0; i < 24; i++) {
+                    uint16_t x100 = (uint16_t)(params[1 + i * 2] |
+                                               ((uint16_t)params[2 + i * 2] << 8));
+                    /* 安全钳制：不接受超过本机最大基础率的下发（防御畸形/恶意包） */
+                    float r = (float)x100 / 100.0f;
+                    if (r < 0.0f) r = 0.0f;
+                    if (r > cap) r = cap;
+                    g_pump_config.profiles[q].slots[i].hour = (uint8_t)i;
+                    if (g_pump_config.profiles[q].slots[i].rate_uh != r) {
+                        g_pump_config.profiles[q].slots[i].rate_uh = r;
+                        changed = true;
+                    }
+                }
+                if (changed) {
+                    dana_cfg_mark_dirty();
+                    Serial.printf("[DANA] 0x66 basal profile %u updated (24 slots)\n", (unsigned)q);
+                }
+            } else {
+                Serial.printf("[DANA] 0x66 short params=%d (need 49), ignored\n", (int)nparams);
+            }
+            resp[0] = 0x00;
+            rn = 1;
+            break;
+        }
+
+        /* ---- 0x53 BOLUS__SET_24_CIR_CF_ARRAY ← 96B ----
+         * [0..47] 24×CIR(2B 小端)  [48..95] 24×CF(2B 小端)
+         * 单位与 0x52 读取分支对称：units=MGDL ⇒ CIR 为整数 g/U，CF 为整数 mg/dL·U⁻¹。
+         * ⚠️ 曾因 dana_dispatch 的 params[48] 太小把后 48B(CF) 静默截断，已扩到 DANA_MAX_PACKET。 */
+        case DANA_CMD_SET_24_CIR_CF: {
+            if (nparams >= 96) {
+                bool changed = false;
+                for (int i = 0; i < 24; i++) {
+                    uint16_t cir = (uint16_t)(params[i * 2] | ((uint16_t)params[i * 2 + 1] << 8));
+                    uint16_t cf  = (uint16_t)(params[48 + i * 2] | ((uint16_t)params[48 + i * 2 + 1] << 8));
+                    if (cir >= 1 && cir <= 300 && g_pump_config.carb_ratio[i] != (float)cir) {
+                        g_pump_config.carb_ratio[i] = (float)cir;  changed = true;
+                    }
+                    if (cf >= 1 && cf <= 1000 && g_pump_config.isf[i] != (float)cf) {
+                        g_pump_config.isf[i] = (float)cf;          changed = true;
+                    }
+                }
+                if (changed) {
+                    dana_cfg_mark_dirty();
+                    Serial.printf("[DANA] 0x53 CIR/CF updated (CIR[0]=%.0f CF[0]=%.0f)\n",
+                                  g_pump_config.carb_ratio[0], g_pump_config.isf[0]);
+                }
+            } else {
+                Serial.printf("[DANA] 0x53 short params=%d (need 96), ignored\n", (int)nparams);
+            }
+            resp[0] = 0x00;
+            rn = 1;
+            break;
+        }
+
+        case DANA_CMD_SET_USER_OPTION:   /* 0x73 */
+        case DANA_CMD_SET_USER_TIME_CHANGE_CLEAR: /* 0x23 */
+        case DANA_CMD_SET_HISTORY_UPLOAD_MODE:    /* 0x25 */
+        case DANA_CMD_SET_HISTORY_SAVE:  /* 0xE0 */
+        case DANA_CMD_APS_SET_EVENT_HISTORY: /* 0xC3 */
+        case DANA_CMD_SET_BOLUS_OPTION:  /* 0x51 */
+        case DANA_CMD_SET_CIR_CF:        /* 0x4F */
+            resp[0] = 0x00;              // result = OK
+            rn = 1;
+            break;
+
+        /* ---- 0x24 REVIEW__GET_MORE_INFORMATION → 定长零填充（本机不产生有效数据）---- */
+        case DANA_CMD_MORE_INFO:
+            rn = 16;
+            break;
+
+        /* ---- 0xC2 APS_HISTORY_EVENTS ----
+         * AAPS 逐条接收，首字节 0xFF 代表「最后一条」→ 置 historyDoneReceived。
+         * loadEvents() 里是 `while (!historyDoneReceived && isConnected) sleep(100)` 的
+         * **死等循环**，不回 0xFF 就永远卡在「读取泵历史」直到断连。
+         * 本机历史由自身 UI 维护，不向 AAPS 回放 → 直接回一条结束标记。
+         * ⚠️ 切勿回自造记录：AAPS processMessage 里 HistoryEntry.fromInt() 对
+         *    未知 recordCode 会 throw InvalidParameterException。 */
+        case DANA_CMD_APS_HISTORY_EVENTS:
+            resp[0] = 0xFF;
+            rn = 1;
+            break;
+
+        default:
+            /* 未识别命令：回足够长的零填充。
+             * ⚠️ 绝不能只回 1 字节 —— 任何读到更远偏移的 handleMessage 都会
+             *    数组越界抛异常，AAPS 随即 5 秒超时 disconnect。
+             * 64B 可覆盖除 0x52(97B) 外所有 AAPS 解析器的最大读取偏移。 */
+            rn = 64;
             break;
     }
 
@@ -450,12 +1032,20 @@ static void dana_dispatch(dana_ctx_t *c, uint8_t type, uint8_t opcode,
             uint8_t resp[DANA_MAX_PACKET]; size_t rl = 0;
             dana_build_pump_check_response(c, resp, &rl);
             c->conn = DANA_CONN_PUMP_CHECK;     // 仍走默认 CRC 分支
+            Serial.println("[DANA] PUMP_CHECK rx -> send resp");
+            dana_trace_log(3, DANA_OP_PUMP_CHECK, 1, nullptr, 0);   // 收到 PUMP_CHECK
             dana_send_raw(resp, rl);
         } else if (opcode == DANA_OP_TIME_INFO) {
             uint8_t resp[DANA_MAX_PACKET]; size_t rl = 0;
             dana_build_time_info_response(c, resp, &rl);
             c->conn = DANA_CONN_HANDSHAKE_DONE; // 进入命令阶段（BLE5 二级加密启用）
             g_pump_state.dana_paired = true;    // 闭环页据此显示"AAPS 已接管"
+            // 执行历史: AAPS 接管 (闭环)
+            uint8_t ap = g_pump_config.active_profile; if (ap >= MAX_BASAL_PROFILES) ap = 0;
+            basal_history_record(BH_AAPS_TAKEOVER, ap, 0, 0,
+                                 (uint16_t)(g_pump_state.current_basal_rate * 100.0f));
+            Serial.println("[DANA] TIME_INFO rx -> paired, send resp");
+            dana_trace_log(3, DANA_OP_TIME_INFO, 1, nullptr, 0);    // 收到 TIME_INFO
             dana_send_raw(resp, rl);
         }
         /* BLE5 简化流程不含 passkey 交换，其余加密请求忽略 */
@@ -497,6 +1087,17 @@ static void dana_feed_rx(const uint8_t *data, size_t len)
         /* 此时 LEN 已解密为明文，可正确判断是否收齐分包 */
         uint8_t plen = g_rxbuf[2];
         size_t  total = (size_t)plen + 7u;
+        /* ★ 边界检查（g_rxbuf 扩到 256 后必需）：LEN 字节来自对端/可能被误解密成乱码，
+         * total 最大可达 262，直接 memcpy 进 pkt[128] 会爆栈。合法包 ≤ 105B(0x53)。
+         * 判定畸形则丢掉这两个起始标记字节，让循环重新找下一个 A5A5。 */
+        if (total > DANA_MAX_PACKET) {
+            Serial.printf("[DANA] bogus LEN=%u (total=%u) -> resync\n",
+                          (unsigned)plen, (unsigned)total);
+            dana_trace_log(4, 0xEE, plen, g_rxbuf, 8);
+            memmove(g_rxbuf, g_rxbuf + 2, g_rxlen - 2);
+            g_rxlen -= 2;
+            continue;
+        }
         if (total > g_rxlen) return;       // 等待后续分片
 
         uint8_t pkt[DANA_MAX_PACKET];
@@ -504,31 +1105,103 @@ static void dana_feed_rx(const uint8_t *data, size_t len)
         memmove(g_rxbuf, g_rxbuf + total, g_rxlen - total);
         g_rxlen -= total;
 
-        uint8_t type, opcode, params[48];
+        /* 参数区必须能装下最大的写入命令：0x53 SET_24_CIR_CF_ARRAY = 96B
+         * (24×2B CIR + 24×2B CF)。此前只有 48B，导致后半段 CF 被静默截断。 */
+        uint8_t type, opcode, params[DANA_MAX_PACKET];
         size_t  nparams = 0;
         /* 注意：分片已在接收边界解密，此处用 dana_unpack_packet 避免二次解密 */
         int r = dana_unpack_packet(&g_dana_ctx, pkt, total, &type, &opcode,
                                    params, sizeof(params), &nparams);
         if (r == 0) dana_dispatch(&g_dana_ctx, type, opcode, params, nparams);
+        else { Serial.printf("[DANA] unpack fail r=%d len=%d\n", r, (int)total);
+               dana_trace_log(4, 0, (uint8_t)(r & 0xFF), pkt, (uint8_t)total); }  // 解析失败
     }
 }
 
 /* FFF2 写回调（手机→泵命令） */
 class DanaChCb : public NimBLECharacteristicCallbacks {
-    void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &) override {
+    void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &info) override {
         std::string v = c->getValue();
-        if (!v.empty()) dana_feed_rx((const uint8_t *)v.data(), v.size());
+        if (!v.empty()) {
+            /* ★ 写 FFF2 的这条连接就是真正在跑 Dana 协议的对端（AAPS）。
+             * 记录它的 connHandle，后续响应定向 notify 回去，杜绝多连接串台。
+             * 切换对端时清空收包缓冲，避免半包与新对端的字节流拼接。 */
+            uint16_t h = info.getConnHandle();
+            if (h != g_dana_peer_conn) {
+                Serial.printf("[DANA] peer conn -> %u (was %u)\n",
+                              (unsigned)h, (unsigned)g_dana_peer_conn);
+                dana_trace_log(3, 0xFA, (uint8_t)(h & 0xFF), nullptr, 0);   // 对端切换
+                g_dana_peer_conn = h;
+                g_rxlen = 0;
+            }
+            dana_dbg_hex("RX", (const uint8_t *)v.data(), v.size());
+            dana_trace_log(0, 0xFF, 0, (const uint8_t *)v.data(), (uint8_t)v.size());  // RX 原始
+            dana_feed_rx((const uint8_t *)v.data(), v.size());
+        }
+    }
+    void onSubscribe(NimBLECharacteristic *c, NimBLEConnInfo &info, uint16_t subValue) override {
+        if (c == g_dana_fff1) {
+            g_fff1_subscribed = (subValue != 0);
+            uint16_t h = info.getConnHandle();
+            if (subValue != 0) {
+                /* 订阅 FFF1 的一定是 Dana 客户端（系统连接不会订阅），先行绑定对端，
+                 * 让首个 PUMP_CHECK 响应就走定向通道。 */
+                if (h != g_dana_peer_conn) { g_dana_peer_conn = h; g_rxlen = 0; }
+            } else if (h == g_dana_peer_conn) {
+                g_dana_peer_conn = BLE_HS_CONN_HANDLE_NONE;   // 取消订阅：解绑，退回广播式 notify
+            }
+            Serial.printf("[BLE] FFF1 subscribe=%d conn=%u\n", subValue ? 1 : 0, (unsigned)h);
+            dana_trace_log(3, 0xFE, (subValue ? 1 : 0), nullptr, 0);   // 订阅状态变化
+        }
     }
 };
 
-/* 连接回调：断连后清理握手状态（与现有自定义 BLE 行为一致） */
+/* 连接回调：AAPS 接管 server 回调后，连接态只能在此维护
+ * （ble_comm.cpp 的 srvCb 已被 setCallbacks 覆盖，故 ble_connected 必须在此设置），
+ * ble_task 据此每秒推送 notify（伴生 App 屏镜像 / 状态）。Dana 握手状态机同步清理。 */
 class DanaSrvCb : public NimBLEServerCallbacks {
-    void onConnect(NimBLEServer *, NimBLEConnInfo &) override {
-        /* 不覆盖 g_pump_state.ble_connected（自定义 BLE 已管理） */
+    void onConnect(NimBLEServer *srv, NimBLEConnInfo &info) override {
+        g_pump_state.ble_connected = true;
+        Serial.println("[BLE] connected");
+        // st: 1=对端已绑定(BOND_BONDED) 0=未绑定(BOND_NONE) —— 直接对应 AAPS connect() 是否会被拦截
+        dana_trace_log(3, 0xFD, (uint8_t)(info.isBonded() ? 1 : 0), nullptr, 0);   // BLE GATT 连接建立
+        // ★ 根因修复 (2026-08-08, logcat + flash trace 双向实证)：连接建立后必须【继续广播】。
+        //   华为/EMUI 对已配对 BLE 设备会自动保持一条系统连接。若此时泵停止广播，
+        //   AAPS 的 connectGatt 走白名单方式发起 (bt_stack 实测 init_filter_policy=1，
+        //   即必须先扫到广播才能建链)，将永远建不了自己的链路 → 30s 后
+        //   bta_gattc_open_fail "Cannot establish Connection" GATT_ERROR(133)
+        //   → AAPS 永远停在「正在连接」死循环。
+        //   NimBLE 最大 3 连接，继续广播即可让 AAPS 建立第二条独立连接。
+        srv->startAdvertising();
+        Serial.println("[BLE] keep advertising after connect (multi-conn)");
     }
-    void onDisconnect(NimBLEServer *) override {
-        g_dana_ctx.conn = DANA_CONN_INIT;   // 重置握手状态机
-        g_rxlen = 0;
+    void onDisconnect(NimBLEServer *p, NimBLEConnInfo &info, int reason) override {
+        uint16_t h = info.getConnHandle();
+        /* ★ 多连接修正：NimBLE 在调用本回调前已把该 peer 从连接表移除，
+         * 故 getConnectedCount() 即剩余连接数。只有全部断开才算「未连接」。 */
+        g_pump_state.ble_connected = (p->getConnectedCount() > 0);
+        if (h == g_dana_peer_conn || g_dana_peer_conn == BLE_HS_CONN_HANDLE_NONE) {
+            /* 断的是 Dana 协议对端（或尚未绑定对端）→ 重置握手状态机 */
+            g_dana_ctx.conn = DANA_CONN_INIT;
+            g_rxlen = 0;
+            g_dana_peer_conn = BLE_HS_CONN_HANDLE_NONE;
+            g_fff1_subscribed = false;
+        } else {
+            /* 断的是华为系统那条旁路连接 —— 绝不能清掉 AAPS 正在进行的握手 */
+            Serial.printf("[BLE] non-Dana conn %u dropped, keep handshake\n", (unsigned)h);
+        }
+        dana_trace_log(3, 0xFC, (uint8_t)reason, nullptr, 0);   // BLE GATT 断开, st=reason
+        p->startAdvertising();                // 断连后重新广播（NimBLE 偶发静默失败，ble_task 有兜底）
+        Serial.printf("[BLE] disconnected conn=%u reason=%d left=%d -> startAdvertising()\n",
+                      (unsigned)h, reason, (int)p->getConnectedCount());
+    }
+    /* 蓝牙配对回调（仅当 IO cap 启用 passkey 时触发；当前 NO_IO/Just Works 下不会调用，
+     * 保留以兼容若改回 DISPLAY_ONLY 的 passkey 调试场景）。 */
+    uint32_t onPassKeyDisplay() override { return g_dana_passkey; }
+    void onConfirmPassKey(NimBLEConnInfo &, uint32_t) override { /* Just Works 下不触发 */ }
+    void onAuthenticationComplete(NimBLEConnInfo &) override {
+        Serial.println("[BLE] paired (Dana-i passkey accepted)");
+        dana_trace_log(3, 0xFB, 1, nullptr, 0);   // 配对/绑定完成（AAPS createBond 或手动配对均触发）
     }
 };
 
@@ -539,19 +1212,44 @@ static DanaSrvCb g_dana_srv_cb;
 void aaps_dana_attach(void *server)
 {
     NimBLEServer *srv = (NimBLEServer *)server;
+    /* 蓝牙配对（2026-08-07 修正，方向反转）：
+     * 之前误把 sm_bonding 关成 0（setSecurityAuth(false,false,false)），以为能绕开
+     * 加密不对称——这是错的，且正是连不上的真正根因。Android 持久化 bond
+     * （bondState=BONDED）的前提是**从机也要请求 bonding**；从机 sm_bonding=0 时
+     * Android 认为本次配对「不持久化」，华为/AAPS 看到的 bondState 永远是 BOND_NONE →
+     * AAPS 走 BLEComm.kt:133 的 createBond()+sleep(10s)+return false 死循环，永远到不了
+     * connectGatt/订阅/PUMP_CHECK。这和 flash trace 的 CONN+AUTH+DISC 却零 SUBSCRIBE 完全吻合。
+     * 修正：恢复从机 bonding=true（LESC），让 Android 持久化 bond；NimBLE 已通过
+     * ble_store_config_init() 把 LTK 落 NVS，连接时加密对称。Dana-i 真正安全在应用层
+     * DANAI_BLE5_KEY 握手，BLE 层只需 bonding 成功即可，AAPS 不校验链路层 MITM/SC 类型。 */
+    /* 蓝牙安全（2026-08-07 修正 v4 — bonding + legacy pairing，关 LESC）：
+     * 必须 sm_bonding=1：让配对响应带 BOND 标志，Android 才会持久化配对（实测 sm_bonding=0
+     * 时重启后泵变"可用设备"不持久化）。但 AAPS 在 STATE_CONNECTED 立即 discoverServices()，
+     * 若链路层用 LESC(sc=true) 加密，Android 10 的 onEncryptionChanged 常不触发 → AAPS 卡
+     * "正在连接"。改用 legacy pairing(sc=false)：加密协商走传统 SMP，onEncryptionChanged 可靠
+     * 触发，AAPS 顺利走完 discoverServices→订阅FFF1→发 PUMP_CHECK。Dana 真正安全在应用层
+     * DANAI_BLE5_KEY 握手，BLE 层只需 bonding 成功即可，AAPS 不校验链路层 MITM/SC 类型。 */
+    NimBLEDevice::setSecurityAuth(true, false, false);
+    NimBLEDevice::setSecurityIOCap(BLE_SM_IO_CAP_NO_IO);
+    g_dana_passkey = (uint32_t)atoi(DANAI_BLE5_KEY);  // 仅作兼容保留，NO_IO 下不触发回调
     dana_ctx_init(&g_dana_ctx, DANAI_DEVICE_NAME, DANAI_BLE5_KEY,
                   DANAI_HW_MODEL, DANAI_PROTOCOL);
 
     srv->setCallbacks(&g_dana_srv_cb);
 
-    NimBLEService *svc = srv->createService(NimBLEUUID((uint8_t *)U_FFF0, 16));
+    NimBLEService *svc = srv->createService(NimBLEUUID(DANA_UUID_FFF0));
 
     /* FFF1：泵→手机（READ + NOTIFY），响应/通知通道 */
-    g_dana_fff1 = svc->createCharacteristic(NimBLEUUID((uint8_t *)U_FFF1, 16),
+    g_dana_fff1 = svc->createCharacteristic(NimBLEUUID(DANA_UUID_FFF1),
                                            NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
-    /* FFF2：手机→泵（WRITE，无响应写） */
-    NimBLECharacteristic *fff2 = svc->createCharacteristic(NimBLEUUID((uint8_t *)U_FFF2, 16),
-                                                          NIMBLE_PROPERTY::WRITE);
+    g_dana_fff1->setCallbacks(&g_dana_ch_cb);
+    /* FFF2：手机→泵（WRITE + WRITE_NR，无响应写）。
+     * ⚠️ 关键：AAPS 用 WRITE_TYPE_NO_RESPONSE 写 FFF2（见 docs §6.1）。
+     * 若只声明 NIMBLE_PROPERTY::WRITE（带响应写），NimBLE 会拒绝 no-response
+     * 写（ATT Write Not Permitted），泵收不到 PUMP_CHECK → AAPS 一直"正在连接"。
+     * 同时保留 WRITE 以兼容个别用带响应写的客户端。 */
+    NimBLECharacteristic *fff2 = svc->createCharacteristic(NimBLEUUID(DANA_UUID_FFF2),
+                                                          NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
     fff2->setCallbacks(&g_dana_ch_cb);
 
     svc->start();
@@ -573,6 +1271,17 @@ extern "C" void aaps_dana_reset_test(void)
 {
     g_dana_ctx.conn = DANA_CONN_INIT;
     g_rxlen = 0;
+    g_dana_peer_conn = BLE_HS_CONN_HANDLE_NONE;
+}
+
+/* 模拟「AAPS 已连接并订阅 FFF1」：打开 aaps_dana_pump() 的发送门控。
+ * 真机由 NimBLE 的 onConnect/onSubscribe 回调置位，主机桩不产生这些事件，
+ * 必须显式打开，否则响应永远滞留在发送队列里、host_drain_tx 抽不到东西。 */
+extern "C" void aaps_dana_host_link_up_test(void)
+{
+    g_fff1_subscribed = true;
+    g_pump_state.ble_connected = true;
+    g_dana_peer_conn = 0;      // 假定对端 connHandle = 0
 }
 #endif
 

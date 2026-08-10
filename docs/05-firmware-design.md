@@ -466,14 +466,14 @@ void safety_task(void* param) {
 ### 6.1.2 单一真源：储药罐类型 + 换算模块（防精度漂移）
 
 - **储药罐类型在 `config.h` 用 `RESERVOIR_TYPE` 唯一选择**（如 `RESERVOIR_TYPE_CY13_DANA` / `RESERVOIR_TYPE_CARTRIDGE_3ML`）。切换耗材只改这一个宏，几何与换算全自动重算，绝不允许多处硬编码。
-- **全部「单位(U)↔微步」换算算法与几何推导集中在 `dosing.h`（单一真源）**：它仅从「内腔直径」推导截面积 / 每转体积 / `STEPS_PER_UNIT` / `STEPS_PER_005U`，并定义以下三函数。固件与模拟器**共用同一份** `dosing.h`，杜绝算法双份。
+- **全部「单位(U)↔微步」换算算法与几何推导集中在 `dosing.h`（单一真源）**：它仅从「内腔直径」推导截面积 / 每转体积 / `STEPS_PER_UNIT` / `STEPS_PER_MIN_DOSE_U`，并定义以下三函数。固件与模拟器**共用同一份** `dosing.h`，杜绝算法双份。
 - 全系统（大剂量 / 基础率 / 排气）禁止任何模块各自拿 `STEPS_PER_UNIT` 现算，必须统一走：
 
 ```c
 // dosing.h — 单位(U) ↔ 微步 唯一换算 (static inline, 单一真源)
 uint32_t units_to_microsteps(float units);   // 四舍五入, 误差 < 1 微步
 float    microsteps_to_units(uint32_t steps);
-float    quantize_units_005(float units);    // 吸附到 0.05U 网格
+float    quantize_units_grid(float units);    // 吸附到 0.1U 最小可靠剂量网格 (=MIN_DOSE_UNITS)
 ```
 
 ### 6.1.3 剂量标定系数 `DOSE_CALIBRATION`

@@ -14,12 +14,12 @@
 #include "config.h"
 
 #include <cmath>
+#include <cstdio>    // snprintf (方案名注入, 模拟器侧无 Arduino.h 自动包含)
 
 static uint32_t g_start_ms = 0;
 static bool     g_override = false;
 
 // ---- 演示数据 ----
-static float  g_basal[24];
 static float  g_glucose = 6.5f;   // mmol/L
 static int8_t g_trend   = 0;      // -2 速降 / -1 缓降 / 0 平稳 / +1 缓升 / +2 速升
 static float  g_today   = 12.5f;  // 今日总量 U
@@ -27,17 +27,45 @@ static int    g_hh = 8, g_mm = 30;
 static float  g_tbr_pct   = 0;    // 临时基础率百分比 (0=无)
 static float  g_tbr_rate  = 0;    // 临时基础率 U/h
 
+// 4 套演示基础率方案 (注入到 g_pump_config.profiles, 与真实固件共用同一份数据)
+static void mock_fill_profiles(void)
+{
+    // profile 0: 昼夜 (夜间低, 白天高)
+    snprintf(g_pump_config.profiles[0].name, sizeof(g_pump_config.profiles[0].name), "昼夜");
+    for (int i = 0; i < 24; i++) g_pump_config.profiles[0].slots[i].rate_uh = 0.60f;
+    g_pump_config.profiles[0].slots[6].rate_uh  = 0.90f;
+    g_pump_config.profiles[0].slots[7].rate_uh  = 1.00f;
+    g_pump_config.profiles[0].slots[8].rate_uh  = 1.00f;
+    g_pump_config.profiles[0].slots[11].rate_uh = 1.10f;
+    g_pump_config.profiles[0].slots[12].rate_uh = 1.00f;
+    g_pump_config.profiles[0].slots[13].rate_uh = 0.95f;
+    g_pump_config.profiles[0].slots[18].rate_uh = 0.90f;
+    g_pump_config.profiles[0].slots[19].rate_uh = 0.80f;
+    g_pump_config.profiles[0].slots[22].rate_uh = 0.70f;
+    // profile 1: 工作日 (整体略高)
+    snprintf(g_pump_config.profiles[1].name, sizeof(g_pump_config.profiles[1].name), "工作日");
+    for (int i = 0; i < 24; i++) g_pump_config.profiles[1].slots[i].rate_uh = 0.80f;
+    g_pump_config.profiles[1].slots[7].rate_uh  = 1.20f;
+    g_pump_config.profiles[1].slots[12].rate_uh = 1.15f;
+    g_pump_config.profiles[1].slots[18].rate_uh = 1.00f;
+    // profile 2: 周末 (整体偏低)
+    snprintf(g_pump_config.profiles[2].name, sizeof(g_pump_config.profiles[2].name), "周末");
+    for (int i = 0; i < 24; i++) g_pump_config.profiles[2].slots[i].rate_uh = 0.55f;
+    g_pump_config.profiles[2].slots[8].rate_uh  = 0.80f;
+    g_pump_config.profiles[2].slots[12].rate_uh = 0.75f;
+    // profile 3: 运动 (低基础率)
+    snprintf(g_pump_config.profiles[3].name, sizeof(g_pump_config.profiles[3].name), "运动");
+    for (int i = 0; i < 24; i++) g_pump_config.profiles[3].slots[i].rate_uh = 0.40f;
+}
+
 void mock_init(void)
 {
     g_start_ms  = 0;
     g_override  = false;
     pump_state_init();
 
-    // 24 段基础率示例 (夜间低, 白天高)
-    for (int i = 0; i < 24; i++) g_basal[i] = 0.60f;
-    g_basal[6] = 0.90f; g_basal[7] = 1.00f; g_basal[8] = 1.00f;
-    g_basal[11] = 1.10f; g_basal[12] = 1.00f; g_basal[13] = 0.95f;
-    g_basal[18] = 0.90f; g_basal[19] = 0.80f; g_basal[22] = 0.70f;
+    mock_fill_profiles();                 // 注入演示方案到 g_pump_config.profiles
+    g_pump_config.active_profile = 0;     // 默认激活"昼夜"
 
     g_glucose = 6.5f; g_trend = 0; g_today = 12.5f;
     g_hh = 8; g_mm = 30; g_pump_state.loop_mode = 0; g_tbr_pct = 0; g_tbr_rate = 0;
@@ -57,9 +85,11 @@ void mock_tick(uint32_t now_ms)
         pump_state_set_state(PUMP_STATE_BASAL);
         g_pump_state.is_primed = true;
 
-        // 当前时段基础率
+        // 当前时段基础率 (取自激活方案, 与真实固件一致)
         int hr = g_hh % 24;
-        g_pump_state.current_basal_rate = g_basal[hr];
+        uint8_t ap = g_pump_config.active_profile;
+        if (ap >= MAX_BASAL_PROFILES) ap = 0;
+        g_pump_state.current_basal_rate = g_pump_config.profiles[ap].slots[hr].rate_uh;
 
         // 电量: 每 30s 掉 1%
         int pct = 100 - (int)(el / 30000);
@@ -108,7 +138,7 @@ void mock_tick(uint32_t now_ms)
         } else {
             g_tbr_pct = 0;
         }
-        g_tbr_rate = g_basal[hr] * (g_tbr_pct / 100.0f);
+        g_tbr_rate = g_pump_config.profiles[ap].slots[hr].rate_uh * (g_tbr_pct / 100.0f);
     }
 }
 
@@ -124,7 +154,18 @@ float  mock_get_tbr_rate(void)     { return g_tbr_rate; }
 float  mock_get_today_total(void)  { return g_today; }
 void   mock_get_clock(int *hh, int *mm) { *hh = g_hh; *mm = g_mm; }
 int    mock_basal_count(void)      { return 24; }
-float  mock_basal_rate(int idx)    { return (idx >= 0 && idx < 24) ? g_basal[idx] : 0; }
+float  mock_basal_rate(int idx)
+{
+    uint8_t ap = g_pump_config.active_profile;
+    if (ap >= MAX_BASAL_PROFILES) ap = 0;
+    return (idx >= 0 && idx < 24) ? g_pump_config.profiles[ap].slots[idx].rate_uh : 0;
+}
+void   mock_basal_set_rate(int idx, float rate)
+{
+    uint8_t ap = g_pump_config.active_profile;
+    if (ap >= MAX_BASAL_PROFILES) ap = 0;
+    if (idx >= 0 && idx < 24) g_pump_config.profiles[ap].slots[idx].rate_uh = rate;
+}
 
 void mock_deliver_bolus(float units)
 {

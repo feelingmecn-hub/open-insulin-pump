@@ -68,4 +68,15 @@ void snapshot_json(char *out, size_t cap);
 // 把全部协议轨迹序列化为 "\"trace\":[...]" JSON 片段 (含 key 与方括号)
 void trace_json(char *out, size_t cap);
 
+// ============================================================
+// 数据驱动自由运行 (用户载入血糖曲线 + 基础率档案, 用真实数据模拟)
+//   mode 0 = 脚本(17步协议演示, 默认);  mode 1 = 数据模拟(replay)
+// ============================================================
+void set_mode(int m);                 // 0=脚本 1=数据模拟
+int  mode(void);
+void load_dataset(const char *json);  // 解析 {"duration","speedup","basal":[24],"glucose":[[t,mgdl]...],"meals":[[t,u]...]}
+void replay_tick(float real_dt_ms);   // 按真实经过时间推进模拟 (仅在 mode=1 且 playing 时有效)
+float sim_min(void);                  // 当前模拟时间(分钟)
+bool  has_dataset(void);
+
 } // namespace linksess

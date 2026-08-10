@@ -21,6 +21,8 @@ class PumpRepository @Inject constructor(
     val pumpStatusFlow: StateFlow<PumpProtocol.PumpStatus?> = ble.pumpStatus
     val iob: StateFlow<Double> = ble.iob
     val reservoir: StateFlow<Int> = ble.reservoir
+    /** 实时状态（SCREEN 通道 20 字节二进制），供原生虚拟屏重画。 */
+    val pumpLiveState: StateFlow<PumpProtocol.PumpLiveState?> = ble.pumpLiveState
 
     fun startScan() = ble.startScan()
     fun stopScan() = ble.stopScan()
@@ -43,5 +45,15 @@ class PumpRepository @Inject constructor(
     suspend fun setTemporaryBasal(rateUh: Double, durationMin: Int) =
         ble.setTemporaryBasal(rateUh, durationMin)
 
-    suspend fun refreshStatus() = ble.readStatus()
+    suspend fun refreshStatus() = ble.refreshStatus()
+
+    /**
+     * 基础率验证测试（CONTROL 0x18）：让泵把当前激活方案 24 段的总量一次性打出。
+     *
+     * 用途：确认「基础率到底有没有写进泵、泵会不会真的驱动电机」。
+     * 泵侧把它记为独立事件「基础率验证」，**不计入**大剂量次数与 IOB，
+     * 历史条目附带实际微步数，可与丝杠位移互相印证。
+     */
+    suspend fun runBasalTest() =
+        ble.sendControl(com.openloop.pump.ble.PumpProtocolSpec.CTRL_CMD_BASAL_TEST)
 }

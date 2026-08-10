@@ -36,5 +36,23 @@ venv/
 # 日志
 *.log
 
+# 固件编译中间产物（仓库只存源码，发布 bin 走 GitHub Releases，详见 docs/13-烧录指南.md）
+code/esp32_firmware/build_out/
+
+# 安卓 Gradle 缓存（保留 gradle/wrapper/gradle-wrapper.jar 以支持无 Gradle 构建）
+code/android_app/.gradle/
+code/android_app/local.properties
+
+# PlatformIO 缓存
+code/esp32_firmware/.pio/
+
+# 第三方 / 参考副本（体积大，非本项目源码，按需本地保留）
+ref/
+dist/
+
+# 损坏 / 临时产物
+code/esp32_firmware/src/lv_font_cn_*.broken_compressed
+code/esp32_firmware/tools/*.bin
+
 # 测试编译产物（源码见 *.cpp / *.py / *.sh，二进制不入库）
 code/esp32_firmware/test/aaps_dana_test

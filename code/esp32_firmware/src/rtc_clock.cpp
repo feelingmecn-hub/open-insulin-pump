@@ -21,6 +21,7 @@
  *   注: ESP32 RTC 晶振存在 ppm 级温漂, 长期运行可能有秒级偏差, 对教学原型可接受;
  *       若需高精度, 可加 NTP(SNTP) 或 DS3231 外置 RTC, 仅替换本文件实现即可。
  */
+#include <Arduino.h>
 #include "rtc_clock.h"
 #include "config.h"
 #include "pump_state.h"   // g_pump_config (持久化基准)
@@ -64,11 +65,26 @@ uint32_t rtc_unix_now(void)
 void rtc_clock_init(void)
 {
     // 开机从持久化基准恢复 (无备份电池时, 这是唯一时间来源)
-    if (g_pump_config.rtc_base_unix != 0) {
-        sys_set_unix(g_pump_config.rtc_base_unix);
+    //
+    // ⚠️ 时间下界保护 (2026-08-08): 恢复出来的基准是"上次回写那一刻"的墙钟,
+    //    设备停机期间它不会前进。若泵放置数天再开机, 恢复值就落后数天,
+    //    AAPS(DanaRSService.readPumpStatus) 会判 |timeDiff| > 1.5h 并
+    //    runAlarm(largetimediff) + danaPump.reset() 直接放弃初始化 (不会下发 0x79 纠正)。
+    //    设备时间不可能早于固件被编译出来的那一刻, 故以编译时刻兜底,
+    //    把「刚烧完固件就连 AAPS」这一最常见场景的误差压到分钟级。
+    const uint32_t build_unix = rtc_build_time_unix();
+    uint32_t base = g_pump_config.rtc_base_unix;
+    if (base < build_unix) base = build_unix;
+
+    if (base >= 1000000000U) {
+        sys_set_unix(base);
         s_set = true;
+        if (g_pump_config.rtc_base_unix != base) {
+            g_pump_config.rtc_base_unix = base;
+            storage_save_config(&g_pump_config);
+        }
     } else {
-        s_set = false;   // 等待用户在设置页 / App / Dana 0x71 设定
+        s_set = false;   // 等待用户在设置页 / App / Dana 0x71/0x79 设定
     }
 }
 
@@ -84,6 +100,22 @@ void rtc_set_unix(uint32_t unix_sec)
     s_set = true;
     g_pump_config.rtc_base_unix = unix_sec;
     storage_save_config(&g_pump_config);    // 持久化, 掉电前/重启后恢复
+}
+
+/* ---- 周期性回写时钟基准 (详见 rtc_clock.h 的 AAPS 1.5h 硬门限说明) ---- */
+#ifndef RTC_PERSIST_INTERVAL_S
+#define RTC_PERSIST_INTERVAL_S 600U         /* 10 分钟 → 重启后最多倒退 10 分钟 */
+#endif
+
+void rtc_clock_tick(void)
+{
+    if (!s_set) return;
+    uint32_t now = rtc_unix_now();
+    if (now == 0) return;
+    /* 只在确实前进了一个完整间隔时才写 flash, 避免无谓擦写 */
+    if (now < g_pump_config.rtc_base_unix + RTC_PERSIST_INTERVAL_S) return;
+    g_pump_config.rtc_base_unix = now;
+    storage_save_config(&g_pump_config);
 }
 
 // 日历 <-> Unix 互转见 rtc_clock.h (inline, 与模拟器共用)

@@ -10,6 +10,7 @@
 #include "pump_types.h"
 
 bool ina226_init(void);
+extern bool g_ina226_online;   // init 自检通过(芯片在线)标志; 测试阶段 226 未接时为 false
 bool ina226_read(ina226_telemetry_t *tel);
 uint16_t ina226_read_bus_voltage_mv(void);
 int32_t  ina226_read_current_ma(void);

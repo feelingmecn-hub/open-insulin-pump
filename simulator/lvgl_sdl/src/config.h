@@ -158,8 +158,10 @@
 #endif
 
 // ---- 剂量网格 / 标定 (全系统) ----
-#define MIN_DOSE_UNITS        0.05f   // 最小给药精度 (U) — 全系统剂量网格
-// 剂量标定系数: 实际硬件导程/笔芯内径与标称存在制造偏差, 实测后修正。默认 1.0 (未标定)。
+#define MIN_DOSE_UNITS        0.1f    // 最小可靠给药剂量 (U) — 全系统剂量网格 / 单剂量下限。
+//   硬件实际精度 ±0.1~0.3U(丝杆背隙为主), 0.1U 为安全可靠下限 (与丹纳原厂大剂量增量一致)。
+//   <0.1U 的细量一律不提供输入入口, 仅由内部微步累加器消化 (见 dosing.h 剂量诚实性原则)。
+// 剂量标定系数: 实际硬件导程/储药罐内径与标称存在制造偏差, 实测后修正。默认 1.0 (未标定)。
 // 该系数作用于唯一换算入口 units_to_microsteps() (见 dosing.h), 全系统剂量随之整体缩放。
 #define DOSE_CALIBRATION      1.0f
 
@@ -172,10 +174,10 @@
 
 
 // ---- 大剂量分批打入 (segmented bolus) ----
-// 真实胰岛素泵以「步进 + 段间停顿」方式给大剂量 (Wellion: 0.05U/步, 1s 间隔, ≈3U/min;
+// 真实胰岛素泵以「步进 + 段间停顿」方式给大剂量 (大剂量最小增量 0.1U/步, 1s 间隔, ≈3U/min;
 // Medtronic 780G: 标准 1.5U/min, 快速 15U/min)。本固件采用同样策略:
-// 每批推 0.05U (最小精度网格), 段间停顿并复检安全 (阻塞/报警/储药器空), 支持中途取消。
-#define BOLUS_SEGMENT_UNITS       MIN_DOSE_UNITS   // 每批 0.05U
+// 每批推 0.1U (最小可靠剂量网格), 段间停顿并复检安全 (阻塞/报警/储药器空), 支持中途取消。
+#define BOLUS_SEGMENT_UNITS       MIN_DOSE_UNITS   // 每批 0.1U (= MIN_DOSE_UNITS 剂量下限)
 #define BOLUS_SEGMENT_INTERVAL_MS 1000             // 段间停顿 1s → 约 3U/min
 #define BOLUS_SPEED_HZ            500
 #define MOTOR_MAX_SPEED_HZ    5000
@@ -233,7 +235,7 @@
 //   · 该窗口同时作为调度器细拍; 基础率仍按 BASAL_TICK_INTERVAL_MS(3 分钟)窗口投递。
 //   · 调小窗口(如 5000~10000)更平滑但队列流量增大; 调大则更省电但连续性略降。
 #define EXT_BOLUS_WINDOW_MS   15000   // 细节拍 / 连续慢滴窗口 (ms)
-#define EXT_BOLUS_MIN_UNITS   0.005f  // 延展量单次投递下限 (U), 远低于 0.05U 网格以保连续, 防极小量空转
+#define EXT_BOLUS_MIN_UNITS   0.005f  // 延展量单次投递下限 (U), 远低于 0.1U 网格以保连续, 防极小量空转
 
 // ============================================================
 // 12. 安全参数
@@ -243,8 +245,18 @@
 #define BLE_TIMEOUT_MS            300000
 #define MAX_CONTINUOUS_STEPS      100000
 #define OVER_TEMP_THRESHOLD_C     60.0f
+#define OVER_TEMP_WARN_C          50.0f   // 过温预警(非阻塞, 接近阈值时提示)
 #define OVER_CURRENT_MA           1000    // INA226 总电流过流阈值
 #define MAX_PRESSURE_KPA          80
+
+// 低药量提前预警阈值 (U): 剩余≤此值触发非阻塞预警, 提示准备换笔芯 (P0-3)
+#define RESERVOIR_LOW_WARN_U      20
+
+// 外部看门狗 TPS3813 的 WDI 喂狗引脚; -1 表示硬件未接线, 此时仅用 ESP32 内部
+// esp_task_wdt。若实际 PCB 已焊接 TPS3813, 将其 WDI 接到某个空闲 GPIO 并在此指定。
+#ifndef PIN_WATCHDOG_WDI
+  #define PIN_WATCHDOG_WDI         -1
+#endif
 
 // ============================================================
 // 13. 任务参数 (FreeRTOS, Arduino-ESP32 内置)
@@ -335,6 +347,15 @@
   #endif
   #define DANAI_HW_MODEL    0x09               // Dana-i (0x0A 亦可)
   #define DANAI_PROTOCOL    0x0A
+#endif
+
+// ============================================================
+// 16. 振动反馈 (P3-15) — 当前原型无震动马达, 仅预留接口
+// ============================================================
+// 接了震动马达就把这里改成对应 GPIO; 仍走 ui_hal_vibrate() 统一驱动。
+// 设为 -1 表示无硬件, ui_hal_vibrate 不动作(仅记录, 供联调观测)。
+#ifndef VIBRATION_PIN
+  #define VIBRATION_PIN  (-1)
 #endif
 
 #include "dosing.h"

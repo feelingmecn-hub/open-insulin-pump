@@ -1,6 +1,7 @@
 /**
  * battery_monitor.cpp — 电池监测 (INA226 + 3S 放电曲线)
  */
+#include <Arduino.h>
 #include "battery_monitor.h"
 #include "config.h"
 #include "ina226.h"
@@ -8,6 +9,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_task_wdt.h"   // P0-1: 看门狗喂狗
 
 static uint8_t pct_from_mv(uint16_t mv)
 {
@@ -31,6 +33,7 @@ void battery_init(void)
 void battery_task(void *arg)
 {
     for (;;) {
+        esp_task_wdt_reset();   // P0-1: 喂狗
         ina226_telemetry_t tel;
         if (ina226_read(&tel)) {
             uint8_t pct = pct_from_mv(tel.bus_voltage_mv);
@@ -39,6 +42,10 @@ void battery_task(void *arg)
             g_pump_state.battery_current_ma =
                 (uint16_t)(tel.current_ma < 0 ? -tel.current_ma : tel.current_ma);
         }
-        vTaskDelay(pdMS_TO_TICKS(5000));
+        // 5 秒采样周期, 但拆成 5 段(每段 1s)持续喂狗, 避免单次长延迟错过看门狗窗口
+        for (int i = 0; i < 5; ++i) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            esp_task_wdt_reset();
+        }
     }
 }

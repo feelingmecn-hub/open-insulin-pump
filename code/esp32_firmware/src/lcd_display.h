@@ -12,7 +12,14 @@
 
 #include <Arduino.h>
 #include "config.h"
+// ⚠️ GFX 库的 ESP32 数据总线类 (Arduino_ESP32SPI 等) 守卫为
+//   #if defined(ESP32) && (CONFIG_IDF_TARGET_ESP32 || ... || CONFIG_IDF_TARGET_ESP32C6 ...)
+// 但 Arduino-ESP32 3.x 在 C6 上只定义 ESP32C6 / CONFIG_IDF_TARGET_ESP32C6, 不定义
+// legacy 的 ESP32 宏, 导致整类(含其 .cpp 实现)被跳过而链接失败。
+// 解决: 整个构建必须带 -D ESP32 (见 flash 工具与下方编译命令的 build.extra_flags),
+// 核心与 NimBLE/LVGL 均以 CONFIG_IDF_TARGET_* 区分芯片, 不受此宏影响。
 #include <Arduino_GFX_Library.h>
+#include <databus/Arduino_ESP32SPI.h>
 #include <lvgl.h>
 
 // 初始化 LCD + LVGL, 创建状态屏 UI

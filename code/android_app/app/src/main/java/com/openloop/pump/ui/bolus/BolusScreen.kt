@@ -22,12 +22,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.compose.ui.text.input.KeyboardOptions
 
 @Composable
 fun BolusScreen(viewModel: BolusViewModel = hiltViewModel()) {
@@ -55,23 +53,34 @@ fun BolusScreen(viewModel: BolusViewModel = hiltViewModel()) {
                 modifier = Modifier.padding(20.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                Text("%.2f".format(units), fontSize = 48.sp, fontWeight = FontWeight.Bold)
-                Text("U (步进 0.05U)", style = MaterialTheme.typography.labelMedium)
+                Text("%.1f".format(units), fontSize = 48.sp, fontWeight = FontWeight.Bold)
+                Text("U (步进 0.1U)", style = MaterialTheme.typography.labelMedium)
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                     modifier = Modifier.padding(top = 12.dp)
                 ) {
-                    Button(onClick = { viewModel.stepUnits(-0.05) }) { Text("−0.05") }
-                    Button(onClick = { viewModel.stepUnits(0.05) }) { Text("+0.05") }
+                    Button(onClick = { viewModel.stepUnits(-0.1) }) { Text("−0.1") }
+                    Button(onClick = { viewModel.stepUnits(0.1) }) { Text("+0.1") }
                 }
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                     modifier = Modifier.padding(top = 8.dp)
                 ) {
-                    listOf(0.5, 1.0, 2.0, 5.0).forEach { q ->
+                    listOf(0.5, 1.0, 2.0, 5.0, 10.0, 25.0).forEach { q ->
                         Button(onClick = { viewModel.setUnits(q) }) { Text("$q") }
                     }
                 }
+                var customText by remember { mutableStateOf("") }
+                OutlinedTextField(
+                    value = customText,
+                    onValueChange = {
+                        customText = it
+                        it.toDoubleOrNull()?.let { v -> if (v > 0) viewModel.setUnits(v) }
+                    },
+                    label = { Text("自定义剂量 (U，可超 25)") },
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                    singleLine = true
+                )
             }
         }
 
@@ -79,7 +88,7 @@ fun BolusScreen(viewModel: BolusViewModel = hiltViewModel()) {
         if (recommended > 0) {
             Card(modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(16.dp)) {
-                    Text("推荐校正剂量：%.2f U".format(recommended))
+                    Text("推荐校正剂量：%.1f U".format(recommended))
                     Button(onClick = viewModel::applyRecommendation) { Text("采用推荐") }
                 }
             }
@@ -110,8 +119,7 @@ fun BolusScreen(viewModel: BolusViewModel = hiltViewModel()) {
             value = noteText,
             onValueChange = { noteText = it; viewModel.setNote(it) },
             label = { Text("备注（餐前 / 校正）") },
-            modifier = Modifier.fillMaxWidth(),
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text)
+            modifier = Modifier.fillMaxWidth()
         )
 
         // 确认
@@ -120,7 +128,7 @@ fun BolusScreen(viewModel: BolusViewModel = hiltViewModel()) {
             enabled = units > 0 && !sending,
             modifier = Modifier.fillMaxWidth()
         ) {
-            Text(if (sending) "发送中…" else "确认推注 %.2f U".format(units))
+            Text(if (sending) "发送中…" else "确认推注 %.1f U".format(units))
         }
 
         result?.let {

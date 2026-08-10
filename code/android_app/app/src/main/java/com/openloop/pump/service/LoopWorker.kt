@@ -14,6 +14,7 @@ import com.openloop.pump.domain.algorithm.ClosedLoopAlgorithm
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedInject
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.flow.first
 
 /**
  * 定时闭环 Worker。
@@ -49,7 +50,7 @@ class LoopWorker @AssistedInject constructor(
         val currentBasal = 1.0
 
         val algo = ClosedLoopAlgorithm(
-            maxBasalRate = maxBasal, maxIob = maxIob, isf = isf, targetGlucose = target
+            maxBasalRate = maxBasal, maxIob = maxIob, defaultIsf = isf, targetGlucose = target
         )
         val out = algo.compute(
             ClosedLoopAlgorithm.Inputs(glucose.mgdl, iob, currentBasal, isf, target)

@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>闭环胰岛素泵 · 电机调试面板</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">⊕</span>
+      <div>
+        <div class="t1">闭环胰岛素泵 · 电机调试面板</div>
+        <div class="t2">无手机 / 无按键 · 可视化 BLE 调试</div>
+      </div>
+    </div>
+    <div class="conn">
+      <span id="connDot" class="dot off"></span>
+      <span id="connText">未连接</span>
+      <button id="btnConnect" class="btn primary">连接泵</button>
+      <button id="btnScan" class="btn ghost">仅扫描</button>
+      <button id="btnDisconnect" class="btn ghost" disabled>断开</button>
+    </div>
+  </header>
+
+  <main class="grid">
+    <!-- 左：电机控制 + 可视化 -->
+    <section class="card span2">
+      <h2>电机手动点动</h2>
+      <div class="motor-wrap">
+        <div class="motor-ctrl">
+          <div class="dir-row">
+            <label class="seg"><input type="radio" name="dir" value="fwd" checked /> 前进（推药）</label>
+            <label class="seg"><input type="radio" name="dir" value="rev" /> 后退（退药）</label>
+          </div>
+          <div class="field">
+            <label>步数（微步）</label>
+            <input id="steps" type="number" value="4000" min="1" step="100" />
+          </div>
+          <div class="field">
+            <label>速度（Hz）</label>
+            <input id="speed" type="number" value="1500" min="200" max="3000" step="100" />
+          </div>
+          <div class="quick">
+            <button class="chip" data-steps="1000">+1000</button>
+            <button class="chip" data-steps="4000">+4000</button>
+            <button class="chip" data-steps="10000">+10000</button>
+            <button class="chip" data-steps="21780">+10U</button>
+          </div>
+          <div class="actions">
+            <button id="btnMove" class="btn big primary">▶ 定量点动</button>
+            <button id="btnJog" class="btn big">∞ 连续点动</button>
+            <button id="btnStop" class="btn big danger">■ 停止</button>
+          </div>
+          <p class="hint">定量点动：填步数，跑完自动释放。连续点动：步数留 0，点「∞ 连续点动」启动、「■ 停止」或撞限位即停（已修复固件死锁）。</p>
+        </div>
+
+        <!-- 活塞 / 注射器可视化 -->
+        <div class="viz">
+          <svg viewBox="0 0 220 320" id="syringe" aria-label="活塞位置">
+            <!-- 筒身 -->
+            <rect x="70" y="20" width="80" height="240" rx="10" fill="#fff" stroke="#0a2a43" stroke-width="3"/>
+            <!-- 药液（随位置上升） -->
+            <rect id="liquid" x="74" y="256" width="72" height="0" fill="#006bb7" opacity="0.85"/>
+            <!-- 刻度 -->
+            <g stroke="#8a95a5" stroke-width="1">
+              <line x1="150" y1="60" x2="160" y2="60"/><line x1="150" y1="110" x2="160" y2="110"/>
+              <line x1="150" y1="160" x2="160" y2="160"/><line x1="150" y1="210" x2="160" y2="210"/>
+            </g>
+            <!-- 活塞杆 -->
+            <rect id="plunger" x="84" y="256" width="52" height="14" rx="3" fill="#1f2733"/>
+            <rect x="104" y="270" width="12" height="30" fill="#1f2733"/>
+            <!-- 针头 -->
+            <path d="M110 260 L110 300 L104 312 L116 312 L110 300 Z" fill="#8a95a5"/>
+            <!-- 旋转齿轮（电机运行中动画） -->
+            <g id="gear" transform="translate(40,180)">
+              <circle r="16" fill="none" stroke="#006bb7" stroke-width="3"/>
+              <g stroke="#006bb7" stroke-width="3">
+                <line x1="-16" y1="0" x2="16" y2="0"/><line x1="0" y1="-16" x2="0" y2="16"/>
+                <line x1="-11" y1="-11" x2="11" y2="11"/><line x1="-11" y1="11" x2="11" y2="-11"/>
+              </g>
+              <circle r="4" fill="#006bb7"/>
+            </g>
+          </svg>
+          <div class="viz-readout">
+            <div class="big" id="posU">0.000 U</div>
+            <div class="sub" id="posSteps">0 微步</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 右：实时状态 -->
+    <section class="card">
+      <h2>实时状态</h2>
+      <div id="stateGrid" class="state-grid">
+        <div class="s"><span class="k">状态</span><span class="v" id="sState">—</span></div>
+        <div class="s"><span class="k">闭环</span><span class="v" id="sLoop">—</span></div>
+        <div class="s"><span class="k">电池</span><span class="v" id="sBatt">—</span></div>
+        <div class="s"><span class="k">报警</span><span class="v" id="sAlarm">—</span></div>
+        <div class="s"><span class="k">储药</span><span class="v" id="sRes">—</span></div>
+        <div class="s"><span class="k">IOB</span><span class="v" id="sIob">—</span></div>
+        <div class="s"><span class="k">基础率</span><span class="v" id="sBasal">—</span></div>
+        <div class="s"><span class="k">血糖</span><span class="v" id="sGlu">—</span></div>
+        <div class="s"><span class="k">时钟</span><span class="v" id="sClk">—</span></div>
+        <div class="s"><span class="k">丢步</span><span class="v" id="sStep">—</span></div>
+      </div>
+      <!-- 大剂量进度 -->
+      <div class="bolus">
+        <div class="bolus-head"><span>大剂量进度</span><span id="bolusPct">0%</span></div>
+        <div class="bar"><div id="bolusBar" class="bar-fill"></div></div>
+      </div>
+      <div class="warn" id="warnBox" style="display:none"></div>
+    </section>
+
+    <!-- 维护操作 -->
+    <section class="card">
+      <h2>维护操作</h2>
+      <div class="row">
+        <input id="primeU" type="number" value="5" min="0.1" max="200" step="0.5" />
+        <button id="btnPrime" class="btn">排气（U）</button>
+      </div>
+      <div class="row">
+        <button id="btnRewind" class="btn">退回装药</button>
+        <button id="btnClear" class="btn">清除报警</button>
+      </div>
+      <h3 class="sub">远程按键（替代实体键逛菜单）</h3>
+      <div class="keypad">
+        <button class="kbtn" data-key="up">▲ 上</button>
+        <button class="kbtn" data-key="down">▼ 下</button>
+        <button class="kbtn" data-key="set">✓ 确认</button>
+        <button class="kbtn" data-key="esc">← 返回</button>
+      </div>
+    </section>
+
+    <!-- 日志 -->
+    <section class="card span3">
+      <h2>操作日志</h2>
+      <div id="log" class="log"></div>
+    </section>
+  </main>
+
+  <footer class="foot">⚠️ 教学原型，严禁接入人体；调试请用「水填充空注射器」，剂量勿超量程。</footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

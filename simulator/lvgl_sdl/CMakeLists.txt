@@ -27,6 +27,15 @@ find_package(SDL2 REQUIRED)
 get_filename_component(_SIM_REAL "${CMAKE_CURRENT_SOURCE_DIR}" REALPATH)
 get_filename_component(_PROJ_ROOT "${_SIM_REAL}/../.." REALPATH)
 
+# 模拟器(纯 C++/SDL)需编译固件侧共享 .cpp (ui_screen.cpp / basal_history.cpp / ...),
+# 这些文件无条件 #include <Arduino.h>。真实 ESP32 Arduino 核心会经 Arduino.h 拉入
+# FreeRTOS (freertos/FreeRTOS.h), 主机无 FreeRTOS, 故改用最小 Arduino.h 桩:
+#   src/arduino_stub/Arduino.h  —— 仅提供 millis()/delay() 等少量符号, 不拉 FreeRTOS。
+# (固件侧重的 Preferences/esp_partition/NimBLE 等在 SIMULATOR 下均被 #ifndef SIMULATOR 守卫排除;
+#  LINK 模式所需的 NimBLE 由 sim/src/NimBLEDevice.h 假实现提供。)
+set(_ARDUINO_STUB "${CMAKE_CURRENT_SOURCE_DIR}/src/arduino_stub")
+message(STATUS "Arduino stub for simulator: ${_ARDUINO_STUB}")
+
 # ---- 联调演示模式 (AAPS 蓝牙动态控制同步演示) ----
 # 开启后: 把真实固件命令分发核心 (aaps_dana.cpp) 编入模拟器, 由 link_session 驱动,
 # 泵屏幕每帧从 g_pump_state 重绘 -> 与 AAPS 命令严格同步; 并起 TCP 控制通道供 GUI 连接。
@@ -37,12 +46,15 @@ if(SIM_LINK_MODE)
     set(SIM_SRC
         src/main.cpp
         src/pump_state.cpp
-        src/ui_screen.cpp
+        ${_PROJ_ROOT}/code/esp32_firmware/src/ui_screen.cpp
         src/ui_hal_link.cpp
         src/link_session.cpp
         src/link_ipc.cpp
         ${_PROJ_ROOT}/code/esp32_firmware/src/aaps_dana.cpp
         ${_PROJ_ROOT}/code/esp32_firmware/src/rtc_clock.cpp
+        ${_PROJ_ROOT}/code/esp32_firmware/src/history_log.cpp
+        ${_PROJ_ROOT}/code/esp32_firmware/src/basal_history.cpp
+        ${_PROJ_ROOT}/code/esp32_firmware/src/dose_log.cpp
         ${_PROJ_ROOT}/test/host/host_glue.cpp
         src/lv_font_cn_16.c
         src/lv_font_cn_12.c
@@ -52,8 +64,11 @@ else()
         src/main.cpp
         src/mock_hal.cpp
         src/pump_state.cpp
-        src/ui_screen.cpp
+        ${_PROJ_ROOT}/code/esp32_firmware/src/ui_screen.cpp
         src/ui_hal_sim.cpp
+        ${_PROJ_ROOT}/code/esp32_firmware/src/history_log.cpp
+        ${_PROJ_ROOT}/code/esp32_firmware/src/basal_history.cpp
+        ${_PROJ_ROOT}/code/esp32_firmware/src/dose_log.cpp
         src/lv_font_cn_16.c
         src/lv_font_cn_12.c
     )
@@ -63,19 +78,29 @@ add_executable(simulator ${SIM_SRC})
 
 if(SIM_LINK_MODE)
     target_compile_definitions(simulator PRIVATE
-        USE_AAPS_DANA AAPS_DANA_HOST_TEST SIM_LINK_MODE)
+        USE_AAPS_DANA AAPS_DANA_HOST_TEST SIM_LINK_MODE SIMULATOR)
     # host_glue 的 g_pump_state 在此模式下为 extern (由 pump_state.cpp 提供)
     target_include_directories(simulator PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${_PROJ_ROOT}/code/esp32_firmware/src
         ${_PROJ_ROOT}/test/host/inc
+        ${_ARDUINO_STUB}
     )
     find_package(Threads REQUIRED)
     target_link_libraries(simulator PRIVATE lvgl::lvgl SDL2::SDL2 Threads::Threads)
 else()
+    target_compile_definitions(simulator PRIVATE SIMULATOR)
     target_include_directories(simulator PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${_PROJ_ROOT}/code/esp32_firmware/src
+        ${_ARDUINO_STUB}
     )
     target_link_libraries(simulator PRIVATE lvgl::lvgl SDL2::SDL2)
+endif()
+
+# Windows 下: TCP 控制通道 (link_ipc.cpp) 需要 ws2_32。
+# 入口点由 main.cpp 自行提供 (WinMain + main 双入口, 见文件尾部), 规避
+# "undefined reference to WinMain"; 不强制 -mconsole, 由 mingw 默认子系统决定。
+if(WIN32)
+    target_link_libraries(simulator PRIVATE ws2_32)
 endif()

@@ -1,9 +1,15 @@
 # ESP32-C6 分区表 (4MB Flash)
-# Name,   Type, SubType,  Offset,   Size,     Flags
-nvs,      data, nvs,      0x9000,   0x6000,
-otadata,  data, ota,      0xf000,   0x2000,
-phy_init, data, phy,      0x11000,  0x1000,
-ota_0,    app,  ota_0,    0x20000,  0x1C0000,
-ota_1,    app,  ota_1,    0x1E0000, 0x1C0000,
-storage,  data, fat,      0x3A0000, 0x50000,
-coredump, data, coredump, 0x3F0000, 0x10000,
+# ⚠️ 关键：app 必须位于 0x10000，与 arduino-cli 标准合并/烧录偏移一致
+#    (ESP32-C6: bootloader@0x0, partitions@0x8000, otadata@0xe000, app@0x10000)
+# 固件仅使用 Preferences(NVS) 持久化，无 OTA 运行时 / FAT / coredump 依赖。
+# 原 OTA 备槽(app1)+SPIFFS+coredump 的闲置空间已划为专用 dose_log 追溯分区。
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x5000,
+otadata,    data, ota,     0xe000,   0x2000,
+app0,       app,  ota_0,   0x10000,  0x140000,
+# 专用紧凑剂量追溯日志 (追加写, 永不覆盖): 约 2.625MB
+# 8字节/条记录可存 ~35 万条 (离散关键事件≈永久; 若记每3分钟基础率≈2年)
+dose_log,   data, 0x99,    0x150000, 0x290000,
+# BLE 握手追踪日志 (AAPS↔泵 全量 RX/TX/状态/错误, 供 boot 模式 esptool 导出分析): 128KB
+# 定长 32B/条 ring buffer, 可存 4096 条; 导出: esptool read_flash 0x3E0000 0x20000
+dana_trace, data, 0x9A,    0x3E0000, 0x020000,

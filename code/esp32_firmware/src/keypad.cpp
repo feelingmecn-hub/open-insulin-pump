@@ -4,12 +4,15 @@
  * 短按键通过 ui_screen_key() 驱动全中文 UI 的导航/编辑/确认/返回;
  * 长按 SET = 保存电机原点, 长按 ESC = 关机 (安全相关, 不进菜单)。
  */
+#include <Arduino.h>
 #include "keypad.h"
 #include "config.h"
 #include "ui_screen.h"        // ui_screen_key()
 
 #include "motor_controller.h" // motor_set_home()
 #include "power_manager.h"    // system_power_off()
+#include "ui_hal.h"           // ui_hal_mark_activity (省电: 按键唤醒屏幕)
+#include "esp_task_wdt.h"     // P0-1: 看门狗喂狗
 
 static const uint8_t KEY_PINS[4] = { PIN_KEY_UP, PIN_KEY_DOWN, PIN_KEY_SET, PIN_KEY_ESC };
 
@@ -57,27 +60,27 @@ static void handle_long(uint8_t idx)
 void keypad_task(void *arg)
 {
     for (;;) {
+        esp_task_wdt_reset();   // P0-1: 喂狗
         uint32_t now = millis();
         for (int i = 0; i < 4; i++) {
             uint8_t v = digitalRead(KEY_PINS[i]);
             if (v == 0 && g_key_state[i] == 1) {
-                // 按下 (下降沿)
+                // 按下 (下降沿): 立即喂 UI 状态机 (FSM 据此启动"按住自动重复")
                 g_key_state[i] = 0;
                 g_press_start[i] = now;
                 g_long_fired[i] = false;
+                ui_hal_mark_activity();   // 省电: 按键唤醒屏幕
+                handle_short(i);
             } else if (v == 1 && g_key_state[i] == 0) {
-                // 释放 (上升沿) → 短按 (未触发过长按)
+                // 释放 (上升沿): 未触发长按则通知 FSM 停止自动重复
                 g_key_state[i] = 1;
+                ui_hal_mark_activity();   // 省电: 松手也算活动(防刚熄屏又因残留事件误判)
                 if (!g_long_fired[i]) {
-                    key_event_t e = (key_event_t)(KEY_UP + i);
-                    push_event(e);
-                    handle_short(i);
+                    ui_screen_release();
                 }
             } else if (v == 0 && !g_long_fired[i] && (now - g_press_start[i] > 1000)) {
-                // 长按 (1s)
+                // 长按 (1s): 安全/系统操作 (SET=存原点, ESC=关机); UP/DOWN 不重复触发
                 g_long_fired[i] = true;
-                key_event_t e = (i == 2) ? KEY_LONG_SET : (i == 3) ? KEY_LONG_ESC : (key_event_t)(KEY_UP + i);
-                push_event(e);
                 handle_long(i);
             }
         }

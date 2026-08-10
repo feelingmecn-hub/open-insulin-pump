@@ -28,6 +28,8 @@ bool motor_enqueue(const motor_command_t *cmd);
 void motor_cancel_bolus(void);
 // 大剂量是否正在进行
 bool motor_bolus_active(void);
+// 手动电机控制: 立即停止连续点动 (BLE CONTROL 0x16 调用)
+void motor_manual_stop(void);
 
 // 丢步/堵转监护
 void motor_start_stall_guard(void);

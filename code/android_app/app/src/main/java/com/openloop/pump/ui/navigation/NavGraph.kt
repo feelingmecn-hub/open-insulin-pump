@@ -7,6 +7,7 @@ import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.WaterDrop
 import androidx.compose.material.icons.filled.Schedule
+import androidx.compose.material.icons.filled.Smartphone
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -29,7 +30,11 @@ import com.openloop.pump.ui.bolus.BolusScreen
 import com.openloop.pump.ui.basal.BasalScreen
 import com.openloop.pump.ui.dashboard.DashboardScreen
 import com.openloop.pump.ui.history.HistoryScreen
+import com.openloop.pump.ui.mirror.PumpMirrorScreen
 import com.openloop.pump.ui.settings.SettingsScreen
+import com.openloop.pump.ui.settings.BasalProfileScreen
+import com.openloop.pump.ui.settings.ClosedLoopParamsScreen
+import com.openloop.pump.ui.motortest.MotorTestScreen
 
 /** 底部导航目标。 */
 sealed class Screen(val route: String, val label: String, val icon: ImageVector) {
@@ -38,10 +43,11 @@ sealed class Screen(val route: String, val label: String, val icon: ImageVector)
     data object Basal : Screen("basal", "基础率", Icons.Filled.Schedule)
     data object History : Screen("history", "历史", Icons.Filled.History)
     data object Settings : Screen("settings", "设置", Icons.Filled.Settings)
+    data object PumpMirror : Screen("mirror", "泵屏", Icons.Filled.Smartphone)
 }
 
 val bottomItems = listOf(
-    Screen.Dashboard, Screen.Bolus, Screen.Basal, Screen.History, Screen.Settings
+    Screen.Dashboard, Screen.Bolus, Screen.Basal, Screen.History, Screen.Settings, Screen.PumpMirror
 )
 
 @Composable
@@ -60,7 +66,16 @@ fun AppNavHost(
             composable(Screen.Bolus.route) { BolusScreen() }
             composable(Screen.Basal.route) { BasalScreen() }
             composable(Screen.History.route) { HistoryScreen() }
-            composable(Screen.Settings.route) { SettingsScreen() }
+            composable(Screen.Settings.route) { SettingsScreen(navController) }
+            composable(Screen.PumpMirror.route) { PumpMirrorScreen() }
+            composable(
+                "basal_profile/{profile}",
+                arguments = listOf(navArgument("profile") { type = NavType.IntType; defaultValue = 0 })
+            ) { back ->
+                BasalProfileScreen(navController, back.arguments?.getInt("profile") ?: 0)
+            }
+            composable("cl_params") { ClosedLoopParamsScreen(navController) }
+            composable("motor_test") { MotorTestScreen() }
         }
     }
 }

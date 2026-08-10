@@ -45,7 +45,7 @@ int main(void)
     c.conn = DANA_CONN_INIT;
     uint8_t t = 0, o = 0, p[16]; size_t np = 0;
     CHECK(dana_parse_packet(&c, buf, bl, &t, &o, p, 16, &np) == 0, "parse PUMP_CHECK resp");
-    CHECK(t == DANA_TYPE_ENC_RESP && o == DANA_OP_PUMP_CHECK, "PUMP_CHECK type/opcode");
+    CHECK(t == DANA_TYPE_ENC_REQ && o == DANA_OP_PUMP_CHECK, "PUMP_CHECK type/opcode");
     CHECK(np == 12 && p[0] == 'O' && p[1] == 'K' && p[3] == 0x09 && p[5] == 0x0A,
           "PUMP_CHECK payload (OK/HW_MODEL/PROTOCOL)");
     CHECK(p[6] == '1' && p[7] == '2' && p[8] == '3' && p[9] == '4' && p[10] == '5' && p[11] == '6',
@@ -56,7 +56,7 @@ int main(void)
     hexprint("TIME_INFO_RESP", buf, bl);
     c.conn = DANA_CONN_INIT;
     CHECK(dana_parse_packet(&c, buf, bl, &t, &o, p, 16, &np) == 0, "parse TIME_INFO resp");
-    CHECK(t == DANA_TYPE_ENC_RESP && o == DANA_OP_TIME_INFO, "TIME_INFO type/opcode");
+    CHECK(t == DANA_TYPE_ENC_REQ && o == DANA_OP_TIME_INFO, "TIME_INFO type/opcode");
     CHECK(np == 2 && p[0] == 'O' && p[1] == 'K', "TIME_INFO payload (OK)");
 
     /* 场景 3: 命令响应 0x4A（命令阶段，BLE5 二级加密） */

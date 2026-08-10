@@ -25,8 +25,8 @@ class ClosedLoopAlgorithm(
         val glucoseMgdl: Int,
         val iob: Double,
         val currentBasal: Double,
-        val isf: Double = defaultIsf,
-        val target: Int = targetGlucose
+        val isf: Double = 50.0,
+        val target: Int = 110
     )
 
     data class Outputs(

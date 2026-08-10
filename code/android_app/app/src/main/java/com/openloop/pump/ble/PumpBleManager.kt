@@ -11,7 +11,6 @@ import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.BroadcastReceiver
@@ -60,6 +59,11 @@ class PumpBleManager @Inject constructor(
     private var statusChar: BluetoothGattCharacteristic? = null
     private var iobChar: BluetoothGattCharacteristic? = null
     private var reservoirChar: BluetoothGattCharacteristic? = null
+    private var cgmChar: BluetoothGattCharacteristic? = null
+    private var controlChar: BluetoothGattCharacteristic? = null
+    private var settingsChar: BluetoothGattCharacteristic? = null
+    private var keyChar: BluetoothGattCharacteristic? = null
+    private var screenChar: BluetoothGattCharacteristic? = null
 
     /** 配对 PIN（固件 passkey）。null = Just Works。 */
     var pairingPin: String? = null
@@ -76,6 +80,13 @@ class PumpBleManager @Inject constructor(
 
     private val _reservoir = MutableStateFlow(0)
     val reservoir: StateFlow<Int> = _reservoir.asStateFlow()
+
+    /** 实时状态（SCREEN 通道 20 字节二进制通知，供原生虚拟屏重画 + 派生上面各流）。 */
+    private val _pumpLiveState = MutableStateFlow<PumpProtocol.PumpLiveState?>(null)
+    val pumpLiveState: StateFlow<PumpProtocol.PumpLiveState?> = _pumpLiveState.asStateFlow()
+
+    private val _pumpNav = MutableStateFlow<PumpProtocol.PumpNav?>(null)
+    val pumpNav: StateFlow<PumpProtocol.PumpNav?> = _pumpNav.asStateFlow()
 
     private val _lastError = MutableStateFlow<String?>(null)
     val lastError: StateFlow<String?> = _lastError.asStateFlow()
@@ -99,14 +110,13 @@ class PumpBleManager @Inject constructor(
         }
         if (_connectionState.value == ConnectionState.Connecting) return
         _connectionState.value = ConnectionState.Scanning
-        val filter = ScanFilter.Builder()
-            .setDeviceName(SCAN_DEVICE_NAME)
-            .build()
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
         try {
-            sc.startScan(listOf(filter), settings, scanCallback)
+            // 不按设备名过滤：ScanFilter.setDeviceName 在部分 Android 10 / EMUI 上按名匹配失败，
+            // 导致 onScanResult 永远不回调。改为扫描全部设备，在 onScanResult 中手动比对设备名。
+            sc.startScan(emptyList(), settings, scanCallback)
         } catch (e: SecurityException) {
             _connectionState.value = ConnectionState.Error("缺少蓝牙扫描权限")
         }
@@ -123,8 +133,11 @@ class PumpBleManager @Inject constructor(
     private val scanCallback = object : ScanCallback() {
         @SuppressLint("MissingPermission")
         override fun onScanResult(callbackType: Int, result: ScanResult?) {
-            val device = result?.device ?: return
-            if (device.name != SCAN_DEVICE_NAME) return
+            val r = result ?: return
+            val device = r.device ?: return
+            // 优先用 scanRecord 中的设备名：部分 ROM 下 device.name 缓存为空导致漏匹配
+            val name = r.scanRecord?.deviceName ?: device.name
+            if (name != SCAN_DEVICE_NAME) return
             stopScan()
             connect(device)
         }
@@ -186,10 +199,23 @@ class PumpBleManager @Inject constructor(
         resetCharacteristics()
         _connectionState.value = ConnectionState.Disconnected
         _pumpStatus.value = null
+        _pumpLiveState.value = null
+        _iob.value = 0.0
+        _reservoir.value = 0
     }
 
     private fun resetCharacteristics() {
-        bolusChar = basalChar = tbrChar = statusChar = iobChar = reservoirChar = null
+        bolusChar = null
+        basalChar = null
+        tbrChar = null
+        statusChar = null
+        iobChar = null
+        reservoirChar = null
+        cgmChar = null
+        controlChar = null
+        settingsChar = null
+        keyChar = null
+        screenChar = null
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
@@ -200,6 +226,8 @@ class PumpBleManager @Inject constructor(
                 BluetoothProfile.STATE_CONNECTED -> {
                     connectDeferred?.complete(true)
                     connectDeferred = null
+                    // 连接成功后统一发现服务（onScanResult 路径此前不调 discoverServices 会卡 Connecting）
+                    runCatching { g.discoverServices() }
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     connectDeferred?.complete(false)
@@ -235,14 +263,16 @@ class PumpBleManager @Inject constructor(
             statusChar = svc.getCharacteristic(PumpUuids.CHAR_STATUS)
             iobChar = svc.getCharacteristic(PumpUuids.CHAR_IOB)
             reservoirChar = svc.getCharacteristic(PumpUuids.CHAR_RESERVOIR)
+            cgmChar = svc.getCharacteristic(PumpUuids.CHAR_CGM)
+            controlChar = svc.getCharacteristic(PumpUuids.CHAR_CONTROL)
+            settingsChar = svc.getCharacteristic(PumpUuids.CHAR_SETTINGS)
+            keyChar = svc.getCharacteristic(PumpUuids.CHAR_KEY)
+            screenChar = svc.getCharacteristic(PumpUuids.CHAR_SCREEN)
 
             enableNotifications(g)
             _connectionState.value = ConnectionState.Connected
             discoverDeferred?.complete(true)
             discoverDeferred = null
-
-            // 主动拉取一次状态
-            readStatusSuspended()
         }
 
         override fun onCharacteristicWrite(
@@ -282,29 +312,54 @@ class PumpBleManager @Inject constructor(
 
     @SuppressLint("MissingPermission")
     private fun enableNotifications(g: BluetoothGatt) {
-        listOfNotNull(statusChar, iobChar, reservoirChar).forEach { char ->
-            g.setCharacteristicNotification(char, true)
-            val cccd = char.getDescriptor(PumpUuids.CCCD) ?: return@forEach
-            val value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                g.writeDescriptor(cccd, value)
-            } else {
-                @Suppress("DEPRECATION")
-                cccd.value = value
-                g.writeDescriptor(cccd)
-            }
+        // 仅订阅 SCREEN 通道：固件每 1Hz 推送 20 字节二进制实时状态（单包 ≤ MTU 载荷上限，无需分片）。
+        val char = screenChar ?: return
+        g.setCharacteristicNotification(char, true)
+        val cccd = char.getDescriptor(PumpUuids.CCCD) ?: return
+        val value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            g.writeDescriptor(cccd, value)
+        } else {
+            @Suppress("DEPRECATION")
+            cccd.value = value
+            g.writeDescriptor(cccd)
         }
     }
 
     @SuppressLint("MissingPermission")
     private fun handleNotification(uuid: java.util.UUID?, value: ByteArray?) {
         value ?: return
-        when (uuid) {
-            PumpUuids.CHAR_STATUS -> PumpProtocol.PumpStatus.fromBytes(value)
-                ?.let { _pumpStatus.value = it }
-            PumpUuids.CHAR_IOB -> PumpProtocol.parseIob(value)?.let { _iob.value = it }
-            PumpUuids.CHAR_RESERVOIR -> PumpProtocol.parseReservoir(value)
-                ?.let { _reservoir.value = it }
+        val u = uuid ?: return
+        when (u) {
+            // SCREEN：20 字节紧凑二进制实时状态。解码后供原生虚拟屏重画，
+            // 并派生出 pumpStatus / iob / reservoir 三个旧流（Dashboard/Bolus/LoopWorker 复用）。
+            PumpUuids.CHAR_SCREEN -> {
+                // 同一 SCREEN 通道承载两类通知：0xA1=实时状态(20B)，0xB1=导航状态(13B)
+                when (value.firstOrNull()?.toInt()?.and(0xFF)) {
+                    0xA1 -> {
+                        val live = PumpProtocol.parsePumpState(value) ?: return
+                        _pumpLiveState.value = live
+                        _iob.value = live.iobUnits
+                        _reservoir.value = live.reservoirUnits.toInt()
+                        _pumpStatus.value = PumpProtocol.PumpStatus(
+                            stateCode = live.mode,
+                            alarmCode = live.alarmCode,
+                            deliveredUnits = 0.0,
+                            reservoirUnits = live.reservoirUnits.toInt(),
+                            batteryMv = 0,
+                            batteryPct = live.batteryPct,
+                            iobUnits = live.iobUnits,
+                            glucoseMgdl = live.glucoseMgdl,
+                            trend = live.glucoseTrend,
+                            loopMode = live.loopMode,
+                            tbrPercent = live.tbrPercent
+                        )
+                    }
+                    0xB1 -> {
+                        _pumpNav.value = PumpProtocol.parsePumpNav(value)
+                    }
+                }
+            }
         }
     }
 
@@ -322,13 +377,19 @@ class PumpBleManager @Inject constructor(
         writeWithAck(gatt ?: return@withContext fail("GATT 未就绪"), char, payload)
     }
 
-    /** 更新基础率单槽。 */
-    suspend fun setBasalSlot(slot: Int, rateUh: Double): Result<Unit> = withContext(Dispatchers.IO) {
+    /** 设置当前基础率 (U/h)。固件伴生通道只支持设置实时运行速率。 */
+    suspend fun setBasalRate(rateUh: Double): Result<Unit> = withContext(Dispatchers.IO) {
         val char = basalChar ?: return@withContext fail("未连接或未发现 Basal 特征")
-        val payload = runCatching { PumpProtocol.buildBasalSlot(slot, rateUh) }
+        val payload = runCatching { PumpProtocol.buildBasalRate(rateUh) }
             .getOrElse { return@withContext Result.failure(it) }
         writeWithAck(gatt ?: return@withContext fail("GATT 未就绪"), char, payload)
     }
+
+    /**
+     * 兼容旧调用：伴生通道仅支持设置当前基础率，slot 参数忽略。
+     * 24 段基础率档案的编辑在泵端完成，App 侧仅做本地规划展示。
+     */
+    suspend fun setBasalSlot(slot: Int, rateUh: Double): Result<Unit> = setBasalRate(rateUh)
 
     /** 发送临时基础率 (TBR)。 */
     suspend fun setTemporaryBasal(rateUh: Double, durationMin: Int): Result<Unit> =
@@ -339,38 +400,83 @@ class PumpBleManager @Inject constructor(
             writeWithAck(gatt ?: return@withContext fail("GATT 未就绪"), char, payload)
         }
 
-    /** 读取一次泵状态。 */
-    suspend fun readStatus(): Result<PumpProtocol.PumpStatus> = withContext(Dispatchers.IO) {
-        val g = gatt ?: return@withContext fail("GATT 未就绪")
-        val char = statusChar ?: return@withContext fail("未连接或未发现 Status 特征")
-        readDeferred = CompletableDeferred()
-        val started = runCatching {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                g.readCharacteristic(char) == BluetoothGatt.GATT_SUCCESS
-            } else {
-                @Suppress("DEPRECATION")
-                g.readCharacteristic(char)
-            }
-        }.getOrDefault(false)
-        if (!started) {
-            readDeferred = null
-            return@withContext fail("发起读取失败")
-        }
-        val data = readDeferred?.await()
-        readDeferred = null
-        val status = data?.let { PumpProtocol.PumpStatus.fromBytes(it) }
-        if (status != null) {
-            _pumpStatus.value = status
-            Result.success(status)
-        } else {
-            Result.failure(IllegalStateException("状态解析失败或 CRC 校验不通过"))
-        }
+    /**
+     * 控制命令：环模式(0/1/2) 或 远程动作 (0x10 排气 / 0x11 清报警 / 0x12 退回 /
+     * 0x13 标定推出 / 0x14 标定应用)。param 为可选浮点参数（排气 ml / 标定量或系数），
+     * null 表示无参单字节指令。伴生 App「设置」页以此直接下发维护/标定指令，不模拟按键。
+     */
+    suspend fun sendControl(modeOrCmd: Int, param: Float? = null): Result<Unit> = withContext(Dispatchers.IO) {
+        val char = controlChar ?: return@withContext fail("未连接或未发现 Control 特征")
+        val payload = PumpProtocol.buildControl(modeOrCmd, param)
+        writeWithAck(gatt ?: return@withContext fail("GATT 未就绪"), char, payload)
     }
 
-    private fun readStatusSuspended() {
-        // 在发现服务后异步触发一次读取（一次性 fire-and-forget，会自行结束）
-        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch { readStatus() }
+    /** 回传血糖 (mg/dl) 与趋势五档码(-2..2)，供泵显示。 */
+    suspend fun sendCgm(mgdl: Int, trend: Int): Result<Unit> = withContext(Dispatchers.IO) {
+        val char = cgmChar ?: return@withContext fail("未连接或未发现 CGM 特征")
+        val payload = PumpProtocol.buildCgm(mgdl, trend)
+        writeWithAck(gatt ?: return@withContext fail("GATT 未就绪"), char, payload)
     }
+
+    /**
+     * 设置通道请求：写 [op][payload][crc] 后读取响应。
+     * GET 类 op 返回结果字节；SET 类 op 返回 1 字节 ack (0=OK / 1=ERR)。
+     */
+    suspend fun requestSettings(op: Int, payload: ByteArray = byteArrayOf()): Result<ByteArray> =
+        withContext(Dispatchers.IO) {
+            val g = gatt ?: return@withContext fail("GATT 未就绪")
+            val char = settingsChar ?: return@withContext fail("未连接或未发现 Settings 特征")
+            val req = PumpProtocol.buildSettings(op, payload)
+            val w = writeWithAck(g, char, req)
+            if (w.isFailure) return@withContext Result.failure(w.exceptionOrNull()!!)
+            readDeferred = CompletableDeferred()
+            val started = runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    g.readCharacteristic(char)
+                    true
+                } else {
+                    @Suppress("DEPRECATION")
+                    g.readCharacteristic(char)
+                }
+            }.getOrDefault(false)
+            if (!started) {
+                readDeferred = null
+                return@withContext fail("发起设置读取失败")
+            }
+            val data = readDeferred?.await()
+            readDeferred = null
+            if (data != null) Result.success(data) else Result.failure(IllegalStateException("设置读取无响应"))
+        }
+
+    /** 远程按键按下（event 见 PumpProtocolSpec.KEY_*）。等同物理按键，泵屏同步。 */
+    suspend fun sendKey(event: Int): Result<Unit> = withContext(Dispatchers.IO) {
+        val char = keyChar ?: return@withContext fail("未连接或未发现 Key 特征")
+        val payload = PumpProtocol.buildKey(event)
+        writeWithAck(gatt ?: return@withContext fail("GATT 未就绪"), char, payload)
+    }
+
+    /** 远程松手：停止"按住自动重复"。 */
+    suspend fun releaseKey(): Result<Unit> = sendKey(PumpProtocolSpec.KEY_RELEASE.toInt())
+
+    /**
+     * 手动电机控制：前进/后退定量步数，或 steps=0 连续点动直到 STOP。
+     * 专用于电机测试（不记账）。dir 见 PumpProtocolSpec.MANUAL_DIR_*。
+     */
+    suspend fun sendManualMove(dir: Int, steps: Long, speedHz: Int): Result<Unit> = withContext(Dispatchers.IO) {
+        val char = controlChar ?: return@withContext fail("未连接或未发现 Control 特征")
+        val payload = PumpProtocol.buildManualMove(dir, steps, speedHz)
+        writeWithAck(gatt ?: return@withContext fail("GATT 未就绪"), char, payload)
+    }
+
+    /** 手动停止：终止正在进行的连续点动。 */
+    suspend fun sendManualStop(): Result<Unit> = withContext(Dispatchers.IO) {
+        val char = controlChar ?: return@withContext fail("未连接或未发现 Control 特征")
+        val payload = PumpProtocol.buildManualStop()
+        writeWithAck(gatt ?: return@withContext fail("GATT 未就绪"), char, payload)
+    }
+
+    /** 主动刷新状态：实时状态由 SCREEN 通道 1Hz 推送，无需主动读取，此处为空操作以保持接口兼容。 */
+    suspend fun refreshStatus(): Result<Unit> = Result.success(Unit)
 
     // ============================================================
     // 底层读写（兼容新旧 API）
@@ -378,18 +484,16 @@ class PumpBleManager @Inject constructor(
 
     private suspend fun writeWithAck(
         g: BluetoothGatt, char: BluetoothGattCharacteristic, value: ByteArray
-    ): Result<Unit> = suspendCancellableCoroutine { cont ->
+    ): Result<Unit> {
         writeDeferred = CompletableDeferred()
         val started = writeCharacteristic(g, char, value)
         if (!started) {
             writeDeferred = null
-            cont.resume(Result.failure(IllegalStateException("发起写入失败")))
-            return@suspendCancellableCoroutine
+            return Result.failure(IllegalStateException("发起写入失败"))
         }
-        cont.invokeOnCancellation { writeDeferred = null }
-        val ok = runCatching { writeDeferred!!.await() }.getOrDefault(false)
+        val ok = try { writeDeferred!!.await() } catch (_: Exception) { false }
         writeDeferred = null
-        cont.resume(if (ok) Result.success(Unit) else Result.failure(IOException2("写入未确认")))
+        return if (ok) Result.success(Unit) else Result.failure(IOException2("写入未确认"))
     }
 
     @SuppressLint("MissingPermission", "DeprecatedBlockingMethod")
@@ -463,7 +567,8 @@ class PumpBleManager @Inject constructor(
     }
 
     companion object {
-        const val SCAN_DEVICE_NAME = "OpenLoop-Pump"
+        /** 项目仅保留 AAPS(Dana-i 伪装) 变体固件，泵广播名为 DANAI_DEVICE_NAME。 */
+        const val SCAN_DEVICE_NAME = "DAN12345AB"
     }
 }
 

@@ -19,6 +19,8 @@
 #include "mock_hal.h"
 #include "ui_hal.h"
 #include "config.h"
+#include "basal_history.h"
+#include "dose_log.h"
 
 #ifdef SIM_LINK_MODE
 #include "link_session.h"
@@ -31,6 +33,12 @@
 #include <cstdio>
 #include <chrono>
 #include <thread>
+
+#ifdef _WIN32
+// Windows GUI 子系统入口需要 WinMain; SDL2 共享库 (libSDL2.dll.a) 不提供
+// SDL2main, 因此自行提供规范入口并调 SDL_SetMainReady()。
+#include <windows.h>
+#endif
 
 // ---- 离屏截图模式: 设置 SIM_SHOT=1 时, 用 SDL 虚拟驱动跑 LVGL,
 //      把渲染出的 320×172 像素存成 BMP 后退出 (无需真实屏幕, 用于预览/CI) ----
@@ -148,6 +156,8 @@ static void handle_events(void)
         } else if (e.type == SDL_MOUSEBUTTONUP) {
             g_mouse_state = LV_INDEV_STATE_RELEASED;
         } else if (e.type == SDL_KEYDOWN) {
+            // 忽略操作系统级自动重复: 长按持续加减由 FSM 自己驱动 (ui_screen_periodic)
+            if (e.key.repeat) break;
             switch (e.key.keysym.sym) {
                 // 菜单导航 (与屏幕按钮一致)
                 case SDLK_UP:    ui_screen_key(KEY_UP);   break;
@@ -155,6 +165,10 @@ static void handle_events(void)
                 case SDLK_RETURN:
                 case SDLK_KP_ENTER: ui_screen_key(KEY_SET); break;
                 case SDLK_ESCAPE: ui_screen_key(KEY_ESC); break;
+#ifdef SIM_LINK_MODE
+                // 联调模式: 键盘导航按键后立即把新界面状态广播给控制面板
+                linkipc::broadcast_status();
+#endif
                 // 快速演示快捷键
 #ifndef SIM_LINK_MODE
                 case SDLK_a: mock_event('a'); break;
@@ -174,25 +188,46 @@ static void handle_events(void)
                 case SDLK_q: s_running = false; break;
                 default: break;
             }
+        } else if (e.type == SDL_KEYUP) {
+            // 按键释放: 停止长按自动重复 (仅导航键关心)
+            switch (e.key.keysym.sym) {
+                case SDLK_UP:
+                case SDLK_DOWN:
+                case SDLK_RETURN:
+                case SDLK_KP_ENTER:
+                case SDLK_ESCAPE: ui_screen_release(); break;
+                default: break;
+            }
         }
     }
 }
 
 #ifdef SIM_LINK_MODE
-static uint32_t g_link_last = 0;
+static uint32_t g_link_last = 0;     // 上次 tick (replay 用 dt)
+static uint32_t g_script_last = 0;   // 上次脚本步进 (delay 节奏用)
 static void link_tick(uint32_t now)
 {
-    if (!linksess::playing()) return;
-    if (now - g_link_last < (uint32_t)linksess::delay_ms()) return;
+    uint32_t dt = (g_link_last == 0) ? 16 : (now - g_link_last);
     g_link_last = now;
+    if (!linksess::playing()) return;
+    if (linksess::mode() == 1) {
+        // 数据模拟: 按真实经过时间推进 (血糖曲线/基础率/IOB/虚拟AAPS)
+        linksess::replay_tick((float)dt);
+        linkipc::broadcast_status();
+        return;
+    }
+    // 脚本(17步协议演示): 按 delay_ms 节奏
+    if (now - g_script_last < (uint32_t)linksess::delay_ms()) return;
+    g_script_last = now;
     bool more = linksess::step();
     linkipc::broadcast_status();
     if (!more) linksess::set_playing(false);
 }
 #endif
 
-int main(void)
+int app_main(int argc, char **argv)
 {
+    (void)argc; (void)argv;
     const char *shot = getenv("SIM_SHOT");
     if (shot && shot[0] != '\0') {
         s_headless = true;
@@ -236,6 +271,8 @@ int main(void)
 
     lv_display_t *disp = lv_display_create(SIM_W, SIM_H);
     lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);   // 原生, 无 SPI 交换
+    /* 白底由 ui_screen.cpp 的 ui_screen_init 经 lv_obj_set_style_bg_color(scr, BG)
+     * 强制 (BG=0xffffff), 此处无需再设 display 背景。 */
     lv_display_set_flush_cb(disp, sdl_flush_cb);
     lv_display_set_buffers(disp, s_draw_buf, nullptr,
                            (size_t)SIM_W * SIM_H * sizeof(lv_color_t),
@@ -257,6 +294,10 @@ int main(void)
 #else
     mock_init();        // 初始化状态机 + 启动自动演示
 #endif
+
+    // 初始化追踪日志 (模拟器下 basal_history 预置样例, dose_log 为 no-op)
+    basal_history_init();
+    dose_log_init();
 
     // ---------- 离屏截图模式: 渲染各主要页面后存图退出 ----------
     if (s_headless) {
@@ -310,6 +351,8 @@ int main(void)
             auto now = std::chrono::steady_clock::now();
             uint32_t ms = (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(
                               now - t0).count();
+            lv_tick_inc(10);              // 维护 LVGL 时间基准 (供 FSM 自动重复/计时使用)
+            ui_screen_periodic();         // 长按自动重复 + 排气自动结束 (headless 不跑 refresh)
             link_tick(ms);
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
@@ -350,3 +393,22 @@ int main(void)
     }
     return 0;
 }
+
+// ---------- 平台入口点 ----------
+// 非 Windows: 标准 main() -> app_main()。
+// Windows: mingw-w64 链接 Windows (GUI) 子系统时期望 WinMain, 链接控制台子系统时
+//   期望 main; 二者在不同 mingw 版本/链接选项下可能取其一, 故同时提供 WinMain 与
+//   main, 由链接器按需选用其一 (SDL2 共享库不带 SDL2main, 自行提供入口以规避
+//   "undefined reference to WinMain")。WinMain 中调用 SDL_SetMainReady() 满足 SDL 规范。
+#ifdef _WIN32
+extern int app_main(int argc, char **argv);
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
+                   LPSTR lpCmdLine, int nCmdShow) {
+    (void)hInstance; (void)hPrevInstance; (void)lpCmdLine; (void)nCmdShow;
+    SDL_SetMainReady();
+    return app_main(__argc, __argv);
+}
+int main(int argc, char **argv) { return app_main(argc, argv); }
+#else
+int main(int argc, char **argv) { return app_main(argc, argv); }
+#endif

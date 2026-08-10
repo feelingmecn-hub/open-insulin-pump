@@ -1,6 +1,7 @@
 package com.openloop.pump.data.nightscout
 
 import com.openloop.pump.data.nightscout.model.NightscoutEntry
+import com.openloop.pump.data.nightscout.model.NightscoutStatus
 import com.openloop.pump.data.nightscout.model.NightscoutTreatment
 import retrofit2.Response
 import retrofit2.http.Body

@@ -143,6 +143,7 @@ typedef struct {
     float    lead_screw_pitch_mm;         // 丝杠导程
     uint16_t motor_microstep;             // 细分系数
     float    units_per_ml;                // 胰岛素浓度
+    float    dose_calibration;            // P3-14: 剂量标定系数 (实测/指令, 默认 1.0)
 
     // --- 安全参数 ---
     uint16_t occlusion_threshold;         // 阻塞检测阈值
@@ -152,6 +153,7 @@ typedef struct {
     // --- 显示 / 用户设置 (持久化, 供本地 UI 与独立手机 App 共用) ---
     uint8_t  display_brightness;          // 背光亮度 0-100 (%)
     uint8_t  keypad_sound;                // 0=关 1=开
+    uint8_t  vibrate_enabled;             // P3-15: 振动反馈开关 0=关 1=开 (默认关)
     uint32_t rtc_base_unix;               // 时钟基准 Unix 秒 (0 = 未设置)
 
     // --- 统计 (累积) ---
@@ -195,7 +197,7 @@ typedef struct {
     uint32_t     motor_max_position;      // 最大位置 (对应空储药器)
     bool         ble_connected;           // BLE 连接状态
     bool         is_primed;               // 是否已排气
-    int8_t       board_temp_c;            // 板载温度
+    float        board_temp_c;            // 板载温度(°C, P3-13: 过温检测源, 来自 ui_hal_get_board_temp_c)
     // --- 闭环 / 临时基础率 / 今日统计 ---
     uint8_t      loop_mode;               // 0 闭环(AAPS接管) / 1 开环(本地档案) / 2 暂停
     uint32_t     today_units_x100;        // 今日累计注射 (U × 100)
@@ -217,6 +219,14 @@ typedef struct {
     uint32_t ext_bolus_start_ms;        // 起始 millis()
     // --- Dana / AAPS 接管状态 ---
     bool     dana_paired;               // AAPS 已完成 Dana 握手接管 (闭环页区分显示)
+
+    // --- P0~P2 新增非阻塞状态/进度(单一真源, 模拟器共用同一份) ---
+    uint8_t  reservoir_low_warn;        // 低药量预警(非阻塞, 1=剩余≤阈值, 提示换笔芯)
+    uint8_t  keypad_locked;             // 按键锁 (1=锁定, 需长按"确认"解锁, 防误触)
+    uint8_t  bolus_progress_pct;        // 大剂量进度 (0-100, 首页/上报显示)
+    uint32_t bolus_delivered_x100;      // 当前大剂量已输注量 (U×100, 供 AAPS 0x40 进度查询/通知)
+    uint8_t  missed_bolus;              // 错过大剂量提醒标志 (1=有待处理提醒, 见 P2-12)
+    uint8_t  over_temp_warn;            // 过温预警(非阻塞, 1=接近阈值)
 } pump_runtime_state_t;
 
 // ============================================================

@@ -17,6 +17,8 @@
 #include "host_glue.h"      // 假硬件层 + TX 捕获 + host_tx_set/clear_ble5
 #include "NimBLEDevice.h"   // 假 NimBLE (aaps_dana_attach 所需)
 #include "config.h"
+#include "ui_screen.h"   // ui_screen_dump_json (联调控制面板手动操控显示)
+#include "ui_hal.h"       // g_last_vib_pat (P3-15 振动观测)
 #include "dosing.h"        // units_to_microsteps (电机演示: 已发药 -> 微步)
 
 #include <cstdio>
@@ -151,6 +153,12 @@ extern "C" void aaps_dana_reset_test(void);
 
 namespace linksess {
 
+/* 前向声明: 以下函数在文件后部 (AAPS 蓝牙客户端段) 定义; replay 数据模拟引擎
+ * 在上方较早就调用它们, 需提前声明以满足 C++ "先声明后使用" 规则。 */
+static int  send_cmd(uint8_t opcode, const uint8_t *params, uint8_t nparams);
+static int  feed_and_recv(const uint8_t *pkt, size_t plen, bool expect_resp);
+static void setup_state(void);
+
 static const int TOTAL = 17;
 
 /* ---------- 对端(AAPS)上下文, 镜像固件握手状态 ---------- */
@@ -167,6 +175,291 @@ static std::vector<LinkStep> g_steps;
 static bool  g_playing = false;
 static int   g_delay_ms = 900;     // 自动播放时每步间隔
 static std::mutex g_mtx;
+
+/* ============================================================
+ * 数据驱动自由运行 (replay) — 用户载入血糖曲线 + 基础率档案
+ * ============================================================ */
+struct MealEvt { float t_min; float dose; bool fired; };
+static bool                     g_has_dataset = false;
+static int                      g_mode = 0;          // 0=脚本 1=数据模拟
+static float                    g_sim_min = 0;       // 当前模拟时间(分钟)
+static float                    g_replay_dur = 1440; // 总时长(分钟)
+static float                    g_speedup = 120;     // 模拟分钟 / 真实秒
+static std::vector<std::pair<float,float>> g_glu;    // (t_min, mgdl)
+static float                    g_basal[24] = {0.5f};
+static std::vector<MealEvt>     g_meals;             // 餐时大剂量
+static std::vector<std::pair<float,float>> g_iob;    // (投递剂量U, 投递时刻sim_min)
+static float                    g_last_bolus_min = -999.0f;
+static bool                     g_suspended = false;
+static bool                     g_replay_inited = false;
+static float                    g_last_iob_record = -999.0f;
+
+// ---- 极简 JSON 数组解析 (仅解析本项目自有 schema, 字段均为受控数字) ----
+static void parse_floats(const char *json, const char *key, float *out, int maxn, int *cnt)
+{
+    *cnt = 0;
+    const char *p = strstr(json, key);
+    if (!p) return;
+    p = strchr(p, '[');
+    if (!p) return;
+    const char *q = p + 1;
+    while (*q && *q != ']' && *cnt < maxn) {
+        while (*q && (*q < '0' || *q > '9') && *q != '-' && *q != '.') {
+            if (*q == ']') return; q++;
+        }
+        if (!*q || *q == ']') return;
+        char *e = nullptr;
+        float v = (float)strtod(q, &e);
+        if (e == q) return;
+        q = e;
+        out[(*cnt)++] = v;
+    }
+}
+
+static void parse_pairs(const char *json, const char *key,
+                        std::vector<std::pair<float,float>> &out, int maxn)
+{
+    out.clear();
+    const char *p = strstr(json, key);
+    if (!p) return;
+    p = strstr(p, "[[");
+    if (!p) return;
+    /* 括号深度扫描: 从 "[["(depth=2) 起, 每个 '[' +1 / ']' -1;
+     * depth 归零即到达本数组结束的 "]]", 立即停止 —— 避免把紧随其后的
+     * 其它数组(如 meals)误当作本数组的 pair 继续解析。 */
+    const char *q = p + 2;
+    int depth = 2;
+    int cnt = 0;
+    while (*q && cnt < maxn) {
+        // 跳到第一个数的起点 (同时维护括号深度)
+        while (*q) {
+            if (*q == '[') { depth++; q++; continue; }
+            if (*q == ']') { depth--; q++; if (depth <= 0) return; continue; }
+            if (((*q >= '0' && *q <= '9') || *q == '-' || *q == '.')) break;
+            q++;
+        }
+        if (!*q || depth <= 0) return;
+        char *e1 = nullptr; float a = (float)strtod(q, &e1); if (e1 == q) return; q = e1;
+        // 跳到第二个数的起点 (维护深度)
+        while (*q) {
+            if (*q == '[') { depth++; q++; continue; }
+            if (*q == ']') { depth--; q++; if (depth <= 0) return; continue; }
+            if (((*q >= '0' && *q <= '9') || *q == '-' || *q == '.')) break;
+            q++;
+        }
+        if (!*q || depth <= 0) return;
+        char *e2 = nullptr; float b = (float)strtod(q, &e2); if (e2 == q) return; q = e2;
+        out.push_back({a, b}); cnt++;
+    }
+}
+
+static float interpolate_glucose(float t)
+{
+    if (g_glu.empty()) return 0.0f;
+    if (t <= g_glu.front().first) return g_glu.front().second;
+    if (t >= g_glu.back().first)  return g_glu.back().second;
+    for (size_t i = 1; i < g_glu.size(); i++) {
+        if (t <= g_glu[i].first) {
+            float t0 = g_glu[i-1].first, v0 = g_glu[i-1].second;
+            float t1 = g_glu[i].first,   v1 = g_glu[i].second;
+            float f = (t1 == t0) ? 0.0f : (t - t0) / (t1 - t0);
+            return v0 + (v1 - v0) * f;
+        }
+    }
+    return g_glu.back().second;
+}
+
+static void record_iob(float units, float at_min)
+{
+    if (units <= 0) return;
+    g_iob.push_back({units, at_min});
+    if (g_iob.size() > 256) g_iob.erase(g_iob.begin());   // 防止无限增长
+}
+
+static void recompute_iob(void)
+{
+    const float DIA = 240.0f;   // 胰岛素活性时长(min) — 与 config IOB_DURATION_HOURS=4h 一致
+    float iob = 0;
+    for (auto &e : g_iob) {
+        float t = g_sim_min - e.second;
+        if (t < 0) t = 0;
+        float frac = (t >= DIA) ? 0.0f : (1.0f - t / DIA);  // Walsh 三角衰减(线性)
+        iob += e.first * frac;
+    }
+    g_pump_state.iob_x10000 = (uint32_t)(iob * 10000.0f + 0.5f);
+}
+
+// 大头剂量字节: {低字节, 高字节, 0} (与 17步 step10 一致)
+static void bolus_bytes(float dose, uint8_t out[3])
+{
+    int ux = (int)(dose * 100.0f + 0.5f);
+    out[0] = (uint8_t)(ux & 0xFF);
+    out[1] = (uint8_t)((ux >> 8) & 0xFF);
+    out[2] = 0;
+}
+
+// 数据模拟开始: 先做 Dana 握手(建立加密通道), 复位泵状态
+static void replay_handshake(void)
+{
+    aaps_dana_reset_test();
+    host_tx_clear_ble5();
+    c_peer.conn = DANA_CONN_INIT;
+    setup_state();                       // 复位 g_pump_state + dana 上下文
+    uint8_t pkt[64]; size_t pl = 0;
+    dana_build_packet(&c_peer, pkt, &pl, DANA_TYPE_ENC_REQ, DANA_OP_PUMP_CHECK, NULL, 0, 0);
+    feed_and_recv(pkt, pl, true);
+    c_peer.conn = DANA_CONN_PUMP_CHECK;
+    dana_build_packet(&c_peer, pkt, &pl, DANA_TYPE_ENC_REQ, DANA_OP_TIME_INFO, NULL, 0, 0);
+    feed_and_recv(pkt, pl, true);
+    c_peer.conn = DANA_CONN_HANDSHAKE_DONE;
+    host_tx_set_ble5(c_peer.ble5_enc_key);   // TX 侧启用二级加密(与 17步一致)
+    g_pump_state.dana_paired = true;
+    g_pump_state.last_glucose_mgdl = 0;
+    g_pump_state.tbr_percent = 0;
+    g_pump_state.tbr_rate = 0;
+    g_pump_state.current_state = (uint8_t)PUMP_STATE_BASAL;
+}
+
+void set_mode(int m)
+{
+    std::lock_guard<std::mutex> lk(g_mtx);
+    g_mode = (m == 1) ? 1 : 0;
+}
+
+int mode(void) { std::lock_guard<std::mutex> lk(g_mtx); return g_mode; }
+
+float sim_min(void) { std::lock_guard<std::mutex> lk(g_mtx); return g_sim_min; }
+
+bool has_dataset(void) { std::lock_guard<std::mutex> lk(g_mtx); return g_has_dataset; }
+
+void load_dataset(const char *json)
+{
+    std::lock_guard<std::mutex> lk(g_mtx);
+    g_glu.clear(); g_meals.clear(); g_iob.clear();
+    for (int i = 0; i < 24; i++) g_basal[i] = 0.5f;
+    int bc = 0;
+    parse_floats(json, "\"basal\"", g_basal, 24, &bc);
+    parse_pairs(json, "\"glucose\"", g_glu, 20000);
+    // meals
+    std::vector<std::pair<float,float>> mp;
+    parse_pairs(json, "\"meals\"", mp, 256);
+    for (auto &m : mp) g_meals.push_back({m.first, m.second, false});
+    const char *p = strstr(json, "\"duration\"");
+    if (p) { p = strchr(p, ':'); if (p) { char *e = nullptr; float d = (float)strtod(p + 1, &e); if (e != p + 1 && d > 0) g_replay_dur = d; } }
+    p = strstr(json, "\"speedup\"");
+    if (p) { p = strchr(p, ':'); if (p) { char *e = nullptr; float s = (float)strtod(p + 1, &e); if (e != p + 1 && s > 0) g_speedup = s; } }
+
+    g_has_dataset = !g_glu.empty();
+    g_sim_min = 0;
+    g_last_bolus_min = -999.0f;
+    g_suspended = false;
+    g_last_iob_record = -999.0f;
+    g_replay_inited = false;     // 下次 play 时重新握手
+}
+
+void replay_tick(float real_dt_ms)
+{
+    std::lock_guard<std::mutex> lk(g_mtx);
+    if (!g_has_dataset || !g_playing) return;
+    if (!g_replay_inited) { replay_handshake(); g_replay_inited = true; }
+
+    float dt_min = (real_dt_ms / 1000.0f) * g_speedup;
+    g_sim_min += dt_min;
+    if (g_sim_min >= g_replay_dur) { g_sim_min = g_replay_dur; g_playing = false; }
+
+    // ---- 血糖插值 + 趋势 ----
+    float mgdl = interpolate_glucose(g_sim_min);
+    g_pump_state.last_glucose_mgdl    = (uint16_t)(mgdl + 0.5f);
+    g_pump_state.last_glucose_time_unix = rtc_unix_now();
+    float mgdl_prev = interpolate_glucose(g_sim_min - 5.0f);
+    float slope = mgdl - mgdl_prev;
+    g_pump_state.glucose_trend = (slope > 8) ? 2 : (slope > 2) ? 1
+                                : (slope < -8) ? -2 : (slope < -2) ? -1 : 0;
+
+    // ---- 基础率连续输注 (按当前小时 + TBR) ----
+    int hour = ((int)(g_sim_min / 60)) % 24;
+    float base = (hour >= 0 && hour < 24) ? g_basal[hour] : 0.5f;
+    if (g_pump_state.tbr_percent > 0 && g_pump_state.tbr_expiry_ms
+        && millis() > g_pump_state.tbr_expiry_ms) {
+        g_pump_state.tbr_percent = 0; g_pump_state.tbr_rate = 0;
+    }
+    float tbr_mult = (g_pump_state.tbr_percent <= 0.0f) ? 0.0f
+                   : (g_pump_state.tbr_percent / 100.0f);
+    float rate = base * tbr_mult;
+    g_pump_state.current_basal_rate = rate;
+    float deliv = rate * (dt_min / 60.0f);   // 本 tick 基础率投递量(U)
+    if (deliv > 0) {
+        uint32_t du = (uint32_t)(deliv * 100.0f + 0.5f);
+        g_host_motor.delivered_units_x100 += du;
+        g_pump_state.today_units_x100     += du;
+        if (g_pump_state.reservoir_units_left > du)
+            g_pump_state.reservoir_units_left -= (uint16_t)(du / 100u + ((du % 100u) ? 1 : 0));
+        else
+            g_pump_state.reservoir_units_left = 0;
+        // 基础率按 15 模拟分钟粒度记入 IOB(避免事件爆炸)
+        if (g_sim_min - g_last_iob_record >= 15.0f) {
+            record_iob(deliv, g_sim_min);
+            g_last_iob_record = g_sim_min;
+        }
+    }
+
+    // ---- 虚拟 AAPS: 餐时大剂量 (走真实固件命令路径) ----
+    for (auto &m : g_meals) {
+        if (!m.fired && g_sim_min >= m.t_min && g_sim_min < m.t_min + dt_min) {
+            uint8_t b[3]; bolus_bytes(m.dose, b);
+            int r = send_cmd(DANA_CMD_STEP_BOLUS_START, b, 3);
+            if (r > 0) {
+                uint32_t du = (uint32_t)(m.dose * 100.0f + 0.5f);
+                g_host_motor.delivered_units_x100 += du;
+                g_pump_state.today_units_x100     += du;
+                if (g_pump_state.reservoir_units_left > du)
+                    g_pump_state.reservoir_units_left -= (uint16_t)(du/100u + ((du%100u)?1:0));
+                else g_pump_state.reservoir_units_left = 0;
+                record_iob(m.dose, g_sim_min);
+                g_last_bolus_min = g_sim_min;
+            }
+            m.fired = true;
+        }
+    }
+
+    // ---- 虚拟 AAPS: 高血糖纠正 (ISF=2) ----
+    float mmol = mgdl / 18.0f;
+    if (mmol > 10.0f && (g_sim_min - g_last_bolus_min) > 90.0f) {
+        float corr = (mmol - 6.0f) / 2.0f;
+        if (corr > 10.0f) corr = 10.0f;
+        corr = quantize_units_grid(corr);
+        if (corr >= 0.1f) {   // 0.1U 最小剂量下限: 量化后 corr 为 0.1 的倍数, 0 即无剂量
+            uint8_t b[3]; bolus_bytes(corr, b);
+            int r = send_cmd(DANA_CMD_STEP_BOLUS_START, b, 3);
+            if (r > 0) {
+                uint32_t du = (uint32_t)(corr * 100.0f + 0.5f);
+                g_host_motor.delivered_units_x100 += du;
+                g_pump_state.today_units_x100     += du;
+                record_iob(corr, g_sim_min);
+                g_last_bolus_min = g_sim_min;
+            }
+        }
+    }
+
+    // ---- 虚拟 AAPS: 低血糖暂停 / 恢复 (TBR 0% / 100%) ----
+    if (mmol < 4.0f && !g_suspended) {
+        uint8_t tbr[3] = { 0, 0, 0 };
+        send_cmd(DANA_CMD_SET_TBR, tbr, 3);
+        g_suspended = true;
+    } else if (mmol > 5.0f && g_suspended) {
+        uint8_t tbr[3] = { 100 & 0xFF, 0, 0 };
+        send_cmd(DANA_CMD_SET_TBR, tbr, 3);
+        g_suspended = false;
+    }
+
+    recompute_iob();
+
+    // ---- 状态机 ----
+    bool bolusing = (g_sim_min - g_last_bolus_min) < 10.0f;
+    g_pump_state.current_state = bolusing ? (uint8_t)PUMP_STATE_BOLUS
+                                          : (uint8_t)PUMP_STATE_BASAL;
+}
+
 
 /* ============================================================
  * AAPS 蓝牙客户端 (与 aaps_link_sim.cpp 一致)
@@ -510,6 +803,13 @@ void reset(void)
     g_trace.clear();
     g_playing = false;
     g_rt_nparams = 0;
+    // 数据模拟状态复位 (保留已载入的数据集, 便于重跑)
+    g_sim_min = 0;
+    g_iob.clear();
+    g_suspended = false;
+    g_last_bolus_min = -999.0f;
+    g_last_iob_record = -999.0f;
+    g_replay_inited = false;
 }
 
 bool step(void)
@@ -600,34 +900,52 @@ void snapshot_json(char *out, size_t cap)
     float    m_units    = m_delivered_x100 / 100.0f;
     uint32_t m_microsteps = units_to_microsteps(m_units);
 
-    snprintf(out, cap,
-        "\"glucose_mmol\":%.2f,"
-        "\"trend\":%d,"
-        "\"clock_h\":%d,\"clock_m\":%d,"
-        "\"reservoir\":%d,\"battery\":%d,"
-        "\"iob\":%.2f,\"today\":%.2f,"
-        "\"tbr_pct\":%.0f,\"tbr_rate\":%.3f,"
-        "\"loop_mode\":%u,\"connected\":%s,\"dana_paired\":%s,"
-        "\"bolus_active\":%s,\"ext_active\":%s,"
-        "\"state\":%u,\"alarm_active\":%s,\"alarm_code\":%u,"
-        "\"basal_rate\":%.2f,"
-        "\"motor_units\":%.2f,\"motor_microsteps\":%u",
-        glucose,
-        (int)g_pump_state.glucose_trend,
-        hh, mm,
-        (int)g_pump_state.reservoir_units_left, (int)g_pump_state.battery_pct,
-        g_pump_state.iob_x10000 / 10000.0f, g_pump_state.today_units_x100 / 100.0f,
-        g_pump_state.tbr_percent, g_pump_state.tbr_rate,
-        (unsigned)g_pump_state.loop_mode,
-        g_pump_state.ble_connected ? "true" : "false",
-        g_pump_state.dana_paired ? "true" : "false",
-        bolus_active ? "true" : "false",
-        g_pump_state.ext_bolus_active ? "true" : "false",
-        (unsigned)g_pump_state.current_state,
-        g_pump_state.alarm_active ? "true" : "false",
-        (unsigned)g_pump_state.alarm_code,
-        g_pump_state.current_basal_rate,
-        m_units, (unsigned)m_microsteps);
+    char nb[48];
+    auto num = [&](const char *fmt, double v) {
+        snprintf(nb, sizeof(nb), fmt, v);
+        return std::string(nb);
+    };
+    auto tf = [](bool b) { return std::string(b ? "true" : "false"); };
+    std::string s;
+    s.reserve(512);
+    s += "\"glucose_mmol\":"; s += num("%.2f", glucose);
+    s += ",\"trend\":";       s += std::to_string((int)g_pump_state.glucose_trend);
+    s += ",\"clock_h\":";      s += std::to_string(hh);
+    s += ",\"clock_m\":";      s += std::to_string(mm);
+    s += ",\"reservoir\":";    s += std::to_string((int)g_pump_state.reservoir_units_left);
+    s += ",\"battery\":";      s += std::to_string((int)g_pump_state.battery_pct);
+    s += ",\"iob\":";          s += num("%.2f", g_pump_state.iob_x10000 / 10000.0f);
+    s += ",\"today\":";        s += num("%.2f", g_pump_state.today_units_x100 / 100.0f);
+    s += ",\"tbr_pct\":";      s += num("%.0f", g_pump_state.tbr_percent);
+    s += ",\"tbr_rate\":";     s += num("%.3f", g_pump_state.tbr_rate);
+    s += ",\"loop_mode\":";    s += std::to_string((unsigned)g_pump_state.loop_mode);
+    s += ",\"connected\":";    s += tf(g_pump_state.ble_connected);
+    s += ",\"dana_paired\":";  s += tf(g_pump_state.dana_paired);
+    s += ",\"bolus_active\":"; s += tf(bolus_active);
+    s += ",\"ext_active\":";   s += tf(g_pump_state.ext_bolus_active);
+    s += ",\"state\":";        s += std::to_string((unsigned)g_pump_state.current_state);
+    s += ",\"alarm_active\":"; s += tf(g_pump_state.alarm_active);
+    s += ",\"alarm_code\":";   s += std::to_string((unsigned)g_pump_state.alarm_code);
+    s += ",\"over_temp_warn\":"; s += tf(g_pump_state.over_temp_warn);
+    s += ",\"board_temp_c\":";   s += num("%.1f", g_pump_state.board_temp_c);
+    s += ",\"basal_rate\":";   s += num("%.2f", g_pump_state.current_basal_rate);
+    s += ",\"dose_calibration\":"; s += num("%.3f", g_pump_config.dose_calibration);
+    s += ",\"vib_last\":";       s += std::to_string(g_last_vib_pat);   // P3-15: 最近振动模式(0=无)
+    s += ",\"motor_units\":";  s += num("%.2f", m_units);
+    s += ",\"motor_microsteps\":"; s += std::to_string((unsigned)m_microsteps);
+    s += ",\"sim_min\":";      s += num("%.1f", g_sim_min);
+    s += ",\"mode\":";         s += std::to_string(g_mode);
+    s += ",\"has_data\":";     s += tf(g_has_dataset);
+    // 当前泵屏 UI 导航/编辑态 (界面/选中/表单值/亮度/时钟), 供联调面板手动操控显示
+    char uibuf[320];
+    ui_screen_dump_json(uibuf, sizeof(uibuf));
+    s += ",\"ui\":";
+    s += uibuf;
+    if (cap > 0) {
+        size_t m = (s.size() < cap - 1) ? s.size() : (cap - 1);
+        memcpy(out, s.data(), m);
+        out[m] = '\0';
+    }
 }
 
 } // namespace linksess

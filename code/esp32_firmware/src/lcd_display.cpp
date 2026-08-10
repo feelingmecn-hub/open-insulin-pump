@@ -4,6 +4,7 @@
  * 移植自 Waveshare 官方 Arduino 示例 (GFX_Library_for_Arduino + LVGL 9.5.0),
  * 渲染全中文状态屏 UI (ui_screen.cpp, 与 PC 模拟器同一份代码)。
  */
+#include <Arduino.h>
 #include "lcd_display.h"
 #include "pump_state.h"   // g_pump_state 实时状态
 #include "pump_types.h"
@@ -25,11 +26,18 @@ static Arduino_GFX *g_gfx = new Arduino_ST7789(
 static uint8_t *s_lvgl_buf = nullptr;
 static uint32_t s_last_tick_ms = 0;
 
+// ---- 省电: 空闲自动熄屏 ----
+static uint32_t s_last_user_activity_ms = 0;   // 最近一次用户/BLE 活动时刻
+static bool     s_display_dimmed = false;      // 当前是否已熄屏
+
+// 由 keypad / ble 在用户或手机交互时调用, 标记"有活动"以唤醒/保持屏幕
+void ui_hal_mark_activity(void) { s_last_user_activity_ms = millis(); }
+
 // ---- 背光 LEDC ----
 #define BACKLIGHT_LEDC_CH      (0)
 #define BACKLIGHT_LEDC_FREQ_HZ (5000)
 #define BACKLIGHT_LEDC_BITS    (8)
-#define LCD_DEFAULT_BRIGHTNESS (40)   // ≤50, 遵守高温警告
+#define LCD_DEFAULT_BRIGHTNESS (10)   // 省电默认 10% (≤50 遵守高温警告)
 
 void lcd_display_backlight(uint8_t percent)
 {
@@ -70,6 +78,7 @@ void lcd_display_init(void)
     g_gfx->displayOn();
     delay(200);
     lcd_display_backlight(LCD_DEFAULT_BRIGHTNESS);
+    s_last_user_activity_ms = millis();   // 启动即视为有活动(避免立即熄屏)
 
     // LVGL
     lv_init();
@@ -104,4 +113,26 @@ void lcd_display_task(void)
     ui_screen_refresh();
 
     lv_timer_handler();
+
+    // ---- 省电: 空闲自动熄屏 ----
+    // 超时且非关键活动(大剂量/报警)时, 仅关闭背光省电; 面板(ST7789)保持唤醒,
+    // 不调 displayOff() —— 否则面板休眠后 SPI/面板状态异常会导致系统复位, 进而 BLE
+    // 断连(手机无法随时连接)。任意按键 / 手机指令 / 关键活动都会经
+    // ui_hal_mark_activity() 唤醒并恢复背光。
+    bool keep_on = ui_hal_bolus_active() || g_pump_state.alarm_active;
+    if (g_pump_config.auto_dim_enabled) {
+        uint32_t idle_ms = now - s_last_user_activity_ms;
+        uint32_t limit_ms = (uint32_t)g_pump_config.auto_dim_timeout_s * 1000UL;
+        if (!s_display_dimmed && idle_ms >= limit_ms && !keep_on) {
+            s_display_dimmed = true;
+            lcd_display_backlight(0);   // 仅关背光(面板仍在线, BLE 不受影响)
+        } else if (s_display_dimmed && (idle_ms < limit_ms || keep_on)) {
+            s_display_dimmed = false;
+            lcd_display_backlight(g_pump_config.display_brightness);
+        }
+    } else if (s_display_dimmed) {
+        // 自动熄屏被关闭: 恢复背光
+        s_display_dimmed = false;
+        lcd_display_backlight(g_pump_config.display_brightness);
+    }
 }

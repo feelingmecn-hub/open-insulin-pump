@@ -157,8 +157,7 @@ python3 test/link_demo_gui.py                                # 连控制面板
 ├── code/
 │   ├── esp32_firmware/       ← ESP32-C6 固件（Arduino 框架，Rev.2）
 │   │   ├── esp32_firmware.ino     ← 主入口（setup/loop + FreeRTOS 任务）
-│   │   ├── lv_conf.h / config.h   ← LVGL 配置 / 引脚与常量
-│   │   ├── src/
+│   │   ├── src/                   ← 全部模块 + lv_conf.h (LVGL 配置) / config.h (引脚与常量)
 │   │   │   ├── ui_screen.{h,cpp}  ← 共用界面（白底中文，320×172）
 │   │   │   ├── ui_hal.h           ← UI 硬件抽象接口
 │   │   │   ├── ui_hal_fw.cpp      ← 固件后端（接真实模块）
@@ -249,12 +248,18 @@ cmake --build build -j
 ```
 依赖：SDL2、CMake、Ninja、Python（fontTools + Pillow，用于 `gen_cn_font.py` 重新生成字体）。详见 [`simulator/lvgl_sdl/README.md`](simulator/lvgl_sdl/README.md)。
 
-### 6.3 固件构建（Arduino IDE）
-1. 安装 Arduino IDE 2.x，附加开发板网址加入：
-   `https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json`
-2. 安装 **esp32 3.x** 开发板包；库管理器安装 **GFX Library for Arduino**、**LVGL 9.5.0**、**NimBLE-Arduino**。
-3. 打开 `code/esp32_firmware/esp32_firmware.ino`，开发板选 **ESP32C6 Dev Module**，Flash 4MB，导入自带 `partitions.csv`。
-4. 上传后串口监视器（115200）查看日志。
+### 6.3 固件构建与烧录（推荐：预编译 bin）
+
+**最简单**：直接用浏览器烧录预编译镜像，**无需在本机安装 Arduino / 编译**。
+预编译镜像位于 `code/esp32_firmware/build_out/release/`：
+
+- `pump_default_factory.bin`（默认变体）
+- `pump_aaps_factory.bin`（AAPS Dana-i 伪装变体）
+
+用浏览器打开 <https://esp.huhn.me> → 选端口 → 选 bin（偏移 `0x0`）→ 勾 Erase All → Flash。
+详见 [`docs/13-烧录指南.md`](docs/13-烧录指南.md)（含 esptool / 乐鑫 Flash Download Tool / 从源码重编译 全部路径与排错）。
+
+> **安全红线**：本项目是教学 / 理论验证原型，**不是医疗器械**，严禁用于任何人体；真机仅可用**空注射器 + 水**验证机械动作。
 
 > ⚠️ **ST7789 关键陷阱**（已写入 `config.h` / `lcd_display.cpp`）：172 宽屏须设列偏移 `LCD_X_GAP=34`；颜色格式 `RGB565_SWAPPED`；GPIO8 为 WS2812 须用 `rgbLedWriteOrdered()`；INA226 的 I2C 须 `Wire.begin(18,19)`（21/22 已被 LCD 占用）。
 

@@ -3,13 +3,11 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- 简化的"泵/水滴"图标前景 -->
+    <!-- 简化的"泵/水滴"图标前景；用 path 画蓝点，避免 aapt2 对 vector <circle> 的 cx/cy/r 属性兼容问题 -->
     <path
         android:fillColor="#FFFFFF"
         android:pathData="M54,30 C54,30 38,52 38,64 a16,16 0 1,0 32,0 C70,52 54,30 54,30 Z" />
-    <circle
+    <path
         android:fillColor="#0E6BA8"
-        android:cx="54"
-        android:cy="64"
-        android:r="6" />
+        android:pathData="M48,64 a6,6 0 1,0 12,0 a6,6 0 1,0 -12,0 Z" />
 </vector>

@@ -27,4 +27,5 @@ float  mock_get_today_total(void);     // 今日总量 U
 void   mock_get_clock(int *hh, int *mm);
 int    mock_basal_count(void);         // 24
 float  mock_basal_rate(int idx);       // 第 idx 段速率 U/h
+void   mock_basal_set_rate(int idx, float rate);  // 写第 idx 段速率 U/h
 void   mock_deliver_bolus(float units);// 触发一次大剂量演示

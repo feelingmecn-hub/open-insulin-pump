@@ -20,6 +20,7 @@
 #include "storage.h"
 #include "history_log.h"     // ui_hal_link 模式需要的桩 (history_log.h 不依赖 Arduino)
 #include "aaps_dana.h"       // dana_decrypt_second_level (协议层, 宿主可用)
+#include <cstring>           // memset/memcpy/memmove (mingw 交叉编译需显式包含)
 #include "host_glue.h"
 
 #include <chrono>
@@ -39,6 +40,10 @@ pump_config_t        g_pump_config;
 #else
 extern pump_runtime_state_t g_pump_state;
 extern pump_config_t        g_pump_config;
+#endif
+
+#ifdef HOST_GLUE_OWNS_STATE
+float g_dose_calib_factor = DOSE_CALIBRATION;   // P3-14: 主机测试用标定系数 (默认 1.0, 仅本模块拥有状态时定义)
 #endif
 
 /* ============================================================
@@ -76,6 +81,15 @@ void host_state_init(void)
     g_pump_state.ble_connected       = true;    // 模拟已 BLE 连接
     g_pump_state.loop_mode           = 0;       // 闭环 (AAPS 接管)
 
+    // 默认闭环参数 (ISF/碳水比/目标血糖), 使向导大剂量在联调/模拟器中也能真实计算 (P1-8)
+    pump_config_apply_default_factors(&g_pump_config);
+
+    /* 与真机 pump_state.cpp 的出厂默认对齐 —— 尤其是最大基础率/大剂量上限：
+     * 这些值参与 0x66/0x4A 的安全钳制，留 0 会让联调结论与真机不一致。 */
+    g_pump_config.max_basal_per_hour = MAX_BASAL_RATE;
+    g_pump_config.max_bolus_single   = MAX_BOLUS_UNITS;
+    g_pump_config.max_bolus_per_hour = MAX_BOLUS_UNITS;
+
     host_reset_logs();
 }
 
@@ -85,7 +99,10 @@ void host_state_init(void)
 bool motor_enqueue(const motor_command_t *cmd)
 {
     g_host_motor.enqueue_count++;
-    if (g_host_motor.active_bolus < 65535) g_host_motor.active_bolus++;
+    // 仅真正的大剂量计入"进行中大剂量"指示; PRIME/REWIND 等单机操作不占用该指示
+    if (cmd && (cmd->type == MOTOR_CMD_BOLUS || cmd->type == MOTOR_CMD_BOLUS_EXT)) {
+        if (g_host_motor.active_bolus < 65535) g_host_motor.active_bolus++;
+    }
     if (cmd) {
         g_host_motor.last_units_x100 = cmd->units_x100;
         if (g_host_motor.delivered_units_x100 + cmd->units_x100 > g_host_motor.delivered_units_x100)
@@ -143,7 +160,9 @@ bool basal_scheduler_extended_bolus_active(void)
 /* ---- 以下为 ui_hal_fw.cpp 在模拟器联调模式下需要的无操作桩 ---- */
 void lcd_display_backlight(uint8_t) { /* 模拟器无真实背光硬件 */ }
 
-void history_log_event(event_type_t, uint8_t, uint32_t, uint16_t) { /* 模拟器不落盘历史 */ }
+/* 注: history_log_event / history_log_count / history_log_read 现由固件
+ * history_log.cpp (SIMULATOR 模式) 提供真实环形缓冲实现, 不再此处空桩,
+ * 使"历史记录"回看屏在联调模拟器中也能真实工作。 */
 
 /* ============================================================
  * 存储桩
