@@ -322,7 +322,11 @@ static inline void dana_cfg_mark_dirty(void)
  * 原因：NimBLE 在 onWrite 的 GAP 事件回调内同步调用 characteristic->notify() 会被栈丢弃
  *       （ATT 通知不能在接收事件处理中并发发起），这是"连上但 AAPS 永远收不到响应、
  *       2 分钟超时断开"的根因。改为异步后，响应在事件循环空闲时发出即可送达。 */
-#define DANA_TXQ_SLOTS 8
+/* ★ 2026-08-10 大剂量「已输注 0.00U」修复：扩容发送队列。
+ * 大剂量期间每段都发一次进度 notify（2U≈20 段 → 约 20 个 Rate + 完成包），
+ * 旧 8 槽在 BLE 流控/loop 取包稍慢时极易填满，把**关键的大剂量完成 notify 直接丢弃**
+ * → AAPS 永远收不到 bolusDone → 超时记 0.00U。扩到 32 槽留足余量。 */
+#define DANA_TXQ_SLOTS 32
 static uint8_t g_txq[DANA_TXQ_SLOTS][DANA_MAX_PACKET];
 static size_t  g_txq_len[DANA_TXQ_SLOTS];
 static int     g_txq_head = 0, g_txq_tail = 0;
@@ -489,7 +493,13 @@ void aaps_notify_bolus_complete(void)
 {
     uint16_t delivered = (uint16_t)(g_pump_state.bolus_delivered_x100 & 0xFFFF);
     uint8_t p[2] = { (uint8_t)(delivered & 0xFF), (uint8_t)(delivered >> 8) };
-    aaps_dana_send_notify(DANA_NOTIFY_DELIVERY_COMPLETE, p, 2);
+    /* ★ 2026-08-10 修复：大剂量完成 notify 重复投递 3 次。
+     * AAPS DanaRS 大剂量完成**完全依赖**此 notify（收到即置 bolusDone，
+     * bolusingTreatment.insulin 只在收到时更新），BLE 不稳时单次极易丢失 →
+     * 超时记「已输注 0.00U」。重复包值相同，AAPS 幂等处理无害；队列已扩到 32 槽
+     * 足够容纳。配合进度 notify 也由 motor 每段发送，送达率显著提高。 */
+    for (int i = 0; i < 3; i++)
+        aaps_dana_send_notify(DANA_NOTIFY_DELIVERY_COMPLETE, p, 2);
 }
 
 void aaps_notify_alarm(uint8_t alarm_code)

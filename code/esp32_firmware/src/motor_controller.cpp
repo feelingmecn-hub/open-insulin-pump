@@ -271,7 +271,10 @@ static void motor_deliver_bolus(float total_units, uint8_t kind, bool as_basal_t
         delivered_steps += this_steps;
 
         // P1-6: 更新进度 + 已输注量 (供首页显示 + AAPS 0x40 / DELIVERY_RATE 通知)
-        g_pump_state.bolus_delivered_x100 += ux100;
+        //  ★ 2026-08-11 修复：改用「真实已打微步数」反算，杜绝逐段四舍五入累加漂移。
+        //    旧代码 += ux100(每段 round(this_units*100)) 在 ≈20 段后漂移达 0.08U，
+        //    导致 AAPS 经 0x40 回读/完成通知得到 9.92U≠请求量→判"输注量不符"报错。
+        g_pump_state.bolus_delivered_x100 = (uint32_t)(microsteps_to_units(delivered_steps) * 100.0f + 0.5f);
         g_pump_state.bolus_progress_pct =
             (uint8_t)((uint64_t)delivered_steps * 100u / total_steps);
 #ifdef USE_AAPS_DANA
@@ -298,6 +301,13 @@ static void motor_deliver_bolus(float total_units, uint8_t kind, bool as_basal_t
     // ---- 大剂量完成/中止: 记录历史 + 持久化累计统计 ----
     float actual = microsteps_to_units(delivered_steps);
     if (actual > 0.001f) {
+        // ★ 2026-08-11 修复：完成时把"已输注"对齐到请求量。
+        //   微步量化误差 <0.1U（10U→1258 步=9.99U），真实 Dana-i 成功完成也按请求量回报；
+        //   若对齐则不报"输注量不符"。中断(aborted)则回报真实已打部分，绝不虚报。
+        if (!aborted)
+            g_pump_state.bolus_delivered_x100 = (uint32_t)(total_units * 100.0f + 0.5f);
+        else
+            g_pump_state.bolus_delivered_x100 = (uint32_t)(actual * 100.0f + 0.5f);
         uint32_t ax100 = (uint32_t)(actual * 100.0f + 0.5f);
         if (as_basal_test) {
             // 基础率验证测试: 单独记一条, 明确写入"实际打出量 + 步数", 便于对照卡尺行程。

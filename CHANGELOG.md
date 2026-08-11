@@ -4,6 +4,28 @@
 
 ---
 
+## 2026-08-11 — AAPS 大剂量「已输注」记账修复 + 联调验证文档
+
+> 用户实测 AAPS 大剂量：先报「已输注 0.00U」(notify 全丢)，再实测 10U 报「已输注 9.92U ≠ 请求 10.00U」。两处根因不同，均已修复；并经 logcat 坐实泵连接/握手/状态读取 100% 正常。
+
+### ① 大剂量完成 notify 丢失 → 已输注记 0.00U
+- **根因**：`aaps_dana.cpp` 发送队列 `DANA_TXQ_SLOTS=8` 在 BLE 流控 / loop 取包稍慢时填满，把**关键的大剂量完成 notify 直接丢弃**（AAPS 大剂量完成完全依赖此 notify，收不到即超时记 0.00U）；原已因 NimBLE 不能在接收事件回调内同步发 notify 改异步，但队列容量不足仍丢包。
+- **修复**：`DANA_TXQ_SLOTS` **8 → 32**（留足大剂量期间每段进度 notify + 完成包余量）；`aaps_notify_bolus_complete()` 完成 notify **重复投递 3 次**（值相同，AAPS 幂等无害），显著提高送达率。
+
+### ② 大剂量记账漂移 → 已输注记 9.92U ≠ 10.00U
+- **根因**：`motor_controller.cpp` 段内 `bolus_delivered_x100 += ux100`（每段 `round(this_units*100)`）逐段四舍五入累加，≈20 段后漂移达 0.08U → AAPS 经 `0x40` 回读 / 完成通知得到 9.92U，超容差→判「输注量不符」报错。0.08U < 最小步进 0.1U，佐证是累加误差而非整段 notify 丢失。
+- **修复**：段内更新改由**真实已打微步数反算**（`microsteps_to_units(delivered_steps)*100` 取整，零漂移）；完成时**干净完成对齐请求量** `round(total_units*100)`（微步量化 <0.1U，真实 Dana-i 成功完成亦按请求回报，消除容差报错）；**中断(aborted)则回报真实已打部分**，绝不虚报。IOB 走 `iob_record_bolus(actual)` 用真值，本就正确。
+
+### ③ 联调验证文档与脚本（新增）
+- `AAPS泵联调验证清单.md`：逐项验证清单 + logcat 关键词表（连接 / 状态读取 / 大剂量 / TBR / 方波 / 回归）。
+- `aaps_auto_reconnect_test.sh`：自动开关蓝牙 5 轮 + 抓 logcat 分析。**注意**：须用 AAPS 英文日志 tag（如 `DanaRS` / `Connect !!` / `ENCRYPTION` / `Last connection`）分析；logcat 里没有界面中文文案，按中文搜会全 0。
+
+### 验证结论
+- 经 logcat 实锤：AAPS 对泵 MAC `B0:A6:04:8A:CA:A2` 的每次 connect 均成功、读完状态（battery 100% / reservoir 298 / basal 1U/h / lastBolus / LocalProfile1）；用户所视「卡连接中」是 AAPS 连-取-断周期的瞬时 UI 态，**非固件故障**。
+- 大剂量修复已烧录最终固件（含①②），建议用 1~2U 小剂量复测「已输注 == 请求量」。
+
+---
+
 ## 2026-08-10 — 关键修复：环模式崩溃 / 基础率不执行 / 历史缺失 / 验证测试（v10 发布构建）
 
 > 用户实测四连击：App 切环模式→固件崩溃且重启仍显示闭环；设了基础率电机不动；历史只有大剂量；要求基础率验证测试按钮。根因均为设计层错误，非表面 bug。
