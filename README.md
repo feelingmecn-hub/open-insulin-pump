@@ -1,5 +1,7 @@
 # 开源闭环胰岛素泵 DIY 项目（理论验证 / 教学原型）
 
+> 📖 English documentation: [README_en.md](README_en.md)
+
 <p align="center">
   <img src="simulator/lvgl_sdl/preview/01_home.png" width="320" alt="主界面预览">
 </p>
@@ -149,6 +151,7 @@ python3 test/link_demo_gui.py                                # 连控制面板
 ```
 闭环胰岛素泵项目/
 ├── README.md                 ← 本文件（项目总览 + 安全声明）
+├── README_en.md              ← 英文版项目总览（面向国外读者）
 ├── CHANGELOG.md              ← 变更记录（含今日更新）
 ├── LICENSE                   ← 软件许可证（MIT + 免责）
 ├── LICENSE-HARDWARE          ← 硬件许可证（CERN-OHL-S + 免责）
