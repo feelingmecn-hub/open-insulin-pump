@@ -160,6 +160,33 @@ bool basal_scheduler_extended_bolus_active(void)
 /* ---- 以下为 ui_hal_fw.cpp 在模拟器联调模式下需要的无操作桩 ---- */
 void lcd_display_backlight(uint8_t) { /* 模拟器无真实背光硬件 */ }
 
+/* P2-9 补全: 主机联调也要能驱动"泵菜单设 TBR"路径, 才能回归验证菜单 TBR 也进
+ * 0xC2 回放。这里忠实实现 ui_hal_set_tbr/cancel_tbr (设状态 + 触发历史钩子),
+ * 与真实固件 ui_hal_fw.cpp 行为一致; 钩子由测试注册(默认 NULL=no-op)。 */
+#include "ui_hal.h"
+static ui_hal_tbr_hist_cb_t s_tbr_hist_cb = NULL;
+
+void ui_hal_register_tbr_history_cb(ui_hal_tbr_hist_cb_t cb) { s_tbr_hist_cb = cb; }
+
+void ui_hal_set_tbr(float percent, uint32_t duration_min)
+{
+    if (percent <= 0.0f || duration_min == 0) { ui_hal_cancel_tbr(); return; }
+    float ref = (g_pump_state.current_basal_rate > 0.0f)
+                ? g_pump_state.current_basal_rate : 0.5f;
+    g_pump_state.tbr_percent = percent;
+    g_pump_state.tbr_rate    = percent / 100.0f * ref;
+    g_pump_state.tbr_expiry_ms = millis() + duration_min * 60000UL;
+    if (s_tbr_hist_cb) s_tbr_hist_cb(UI_HAL_TBR_EVENT_START, (uint16_t)percent, (uint16_t)duration_min);
+}
+
+void ui_hal_cancel_tbr(void)
+{
+    g_pump_state.tbr_percent = 0;
+    g_pump_state.tbr_rate    = 0;
+    g_pump_state.tbr_expiry_ms = 0;
+    if (s_tbr_hist_cb) s_tbr_hist_cb(UI_HAL_TBR_EVENT_STOP, 0, 0);
+}
+
 /* 注: history_log_event / history_log_count / history_log_read 现由固件
  * history_log.cpp (SIMULATOR 模式) 提供真实环形缓冲实现, 不再此处空桩,
  * 使"历史记录"回看屏在联调模拟器中也能真实工作。 */

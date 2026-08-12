@@ -4,6 +4,33 @@
 
 ---
 
+## 2026-08-12 — TBR 临时基础率设置失败修复 + 泵菜单 TBR 进 AAPS 账本
+
+> 用户实测闭环：AAPS 设 TBR 报 `Temp basal set :成功:false 评论:临时基础输注错误`，治疗页也看不到泵本地菜单设的 TBR。两处根因不同，均已修复。
+
+### ① AAPS 闭环设 TBR 失败（setTempBasal false）根因（logcat 坐实）
+- AAPS `setTempBasalPercent/ Absolute`（DanaRSPlugin.kt）成功需同时满足三条件：`connectionOK` + `isTempBasalInProgress`(0x02 状态 bit4=0x10) + percent 匹配。任一不满足即报「临时基础输注错误」。
+- **Bug A（字节数误判跳过整段 TBR）**：固件旧 `0x60`(SET_TEMPORARY_BASAL 手动 TBR) handler 要求 `nparams>=3`，但 AAPS 实发 **2 字节** `[pct u8][durHours u8]`（logcat `B2 60 00 01` = 0%/1h）→ 条件不成立，整段 TBR 处理被跳过，状态从未更新。
+- **Bug B（0% low-temp 置不了「进行中」位）**：0x02 状态位与 `basal_scheduler` 原都用 `tbr_percent>0` 判 TBR 进行中；闭环发 **0% low-temp**（ hypoglycemia 保护）时该位不置 → AAPS 读回 `isTempBasalInProgress=false` → 验证失败。
+- **字节布局（AAPS 源码确认）**：`0x60`=`[pct u8][durHours u8]`（小时）；`0xC1`(APS_TBR)=`[pct 2B LE][durCode u8]`（`PARAM15MIN=150`/`PARAM30MIN=160`：`percent≥100→150(15min)`，`percent<100→160(30min)`，与真 Dana-i 一致）；`0x62`=取消。
+
+### ② 修复（aaps_dana.cpp + basal_scheduler.cpp）
+- 拆分 `DANA_CMD_APS_TBR`(0xC1, `nparams>=3`) 与 `DANA_CMD_SET_TBR`(0x60, `nparams>=2`) 两个 handler，各自按真实字节布局写入 `tbr_percent/tbr_rate/tbr_expiry_ms` 并记 `TEMP_START` 历史。
+- 0x02 状态位与 `basal_scheduler` 的 TBR 生效判据统一改为基于 `millis() < tbr_expiry_ms`（含 0% low-temp 也置 0x10 位、也生效为 0 U/h）。
+- `basal_scheduler::basal_rate_for_now`：到期清除逻辑修正，`now < tbr_expiry_ms` 即套用 `tbr_rate`（0% → 0 U/h，闭环低血糖保护真生效）。
+
+### ③ 泵菜单 TBR 路径补全（HAL 钩子进 0xC2 回放）
+- 泵本地菜单（`ui_screen.cpp` 的 `SCR_TBR`）经 `ui_hal_set_tbr()/ui_hal_cancel_tbr()` 落状态，**不经 0x60/0xC1**，原不喂 AAPS `0xC2` 回放缓冲 → AAPS 看不到菜单 TBR。
+- 架构约束：HAL 层（`ui_hal.h`）不可反向依赖 Dana 协议层（`aaps_dana.cpp`）。方案：在 `ui_hal.h` 新增中性 `UI_HAL_TBR_EVENT_START/STOP` 常量 + `ui_hal_register_tbr_history_cb()` 钩子；`ui_hal_fw.cpp` 在 set/cancel 落状态时触发钩子；`aaps_dana.cpp` 注册 `aaps_tbr_hist_cb`（包装 `aaps_dana_record_tbr`）。`test/host/host_glue.cpp` 桩同步忠实实现 `ui_hal_set_tbr/cancel_tbr`（替代原 no-op）。
+
+### ④ 验证
+- 主机联调（真实固件命令分发）**PASS=75 FAIL=0**：新增 [19] 菜单 TBR 端到端（注册真实记录钩子 → `ui_hal_set_tbr(120%/45min)` → 0xC2 回放断言 `TEMP_START(120%/45min)` → `ui_hal_cancel_tbr()` → 断言 `TEMP_STOP`）。
+- ESP32 全量固件重编成功（v10_debug，1,221,824B）。
+- **真机验证（2026-08-12）**：烧录后 AAPS 发 `B2 C1 F4 01 96`(500%, durCode=150) → `Temp basal in progress: true` → `setTempBasalAbsolute: high temp basal set ok`；11:30 手动 0%/2h(0x60) 也 `setTempBasalPercent: OK`。旧 `Failed to set temp basal. isTempBasalInProgress: false` 彻底消失。
+- 泵菜单 TBR 真机落账本验证：待下次烧录后于泵屏设一条 TBR，logcat 确认 AAPS 收到 `**NEW** EVENT TEMP_START`（钩子已接、主机联调验过，走同 0xC2 路径）。
+
+---
+
 ## 2026-08-12 — AAPS 历史事件(0xC2)回放修复：治疗页全量记账（大剂量/TBR/方波）
 
 > 用户实测：修复前 AAPS 里**所有对泵的操作记录（大剂量/临时基础率/方波）都看不到**——治疗-碳水与大剂量页永远空。根因：固件对 `0xC2`(APS_HISTORY_EVENTS) 历来只回 `0xFF`、从不回放历史记录，而 AAPS 仅在 `loadEvents()` 读回 BOLUS/TEMP/EXTENDED 记录时才 `syncXxxWithPumpId` 写账本。已真机验证修复。

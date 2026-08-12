@@ -63,9 +63,9 @@ static float basal_rate_for_now(void)
 
     // 临时基础率优先 (有效期内)
     uint32_t now = millis();
-    if (g_pump_state.tbr_percent > 0 && now < g_pump_state.tbr_expiry_ms) {
-        base = g_pump_state.tbr_rate;   // tbr_rate 为绝对 U/h
-    } else if (g_pump_state.tbr_percent > 0 && now >= g_pump_state.tbr_expiry_ms) {
+    if (now < g_pump_state.tbr_expiry_ms) {
+        base = g_pump_state.tbr_rate;   // tbr_rate 为绝对 U/h (0% low-temp → 0, 闭环低血糖保护生效)
+    } else if (now >= g_pump_state.tbr_expiry_ms && g_pump_state.tbr_percent != 0.0f) {
         // 到期, 清除 TBR
         g_pump_state.tbr_percent = 0;
         g_pump_state.tbr_rate    = 0;

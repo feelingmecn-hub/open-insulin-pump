@@ -519,6 +519,14 @@ void aaps_dana_record_tbr(uint8_t code, uint32_t ts, uint16_t percent, uint16_t 
     dana_history_add(code, ts, percent, dur_min);
 }
 
+/* TBR 历史记录钩子包装: 供 ui_hal 在泵菜单设/取 TBR 时回调, 把事件写入 0xC2 回放缓冲。
+ * 让 AAPS 也能看到本地菜单设的 TBR (与 BLE 0x60/0xC1 路径共用同一缓冲, 不重复)。 */
+static uint32_t dana_local_now(void);   // 前向声明 (定义见下方 ~638 行)
+static void aaps_tbr_hist_cb(uint8_t code, uint16_t percent, uint16_t dur_min)
+{
+    aaps_dana_record_tbr(code, dana_local_now(), percent, dur_min);
+}
+
 /* 把 from(UTC 6 字节: 年-2000,月,日,时,分,秒) 之后的记录逐条回放, 末尾补 0xFF。
  * 每条记录作为独立 RESPONSE(0xC2) 包入队(异步发送), AAPS 缓冲后于 0xFF 统一处理。
  * from 为 AAPS 首读的特例 (0,1,1,0,0,0 → 公元2000) 时 from_ts=0, 回放全部。 */
@@ -698,20 +706,34 @@ int aaps_dana_handle_command(dana_ctx_t *c, uint8_t opcode,
             motor_cancel_bolus();
             break;
 
-        case DANA_CMD_APS_TBR:           /* 0xC1 闭环临时基础率 */
-        case DANA_CMD_SET_TBR: {         /* 0x60 手动临时基础率 */
+        case DANA_CMD_APS_TBR:           /* 0xC1 闭环 TBR (AAPS: [pct 2B LE][durCode u8]; 150→15min 160→30min) */
             if (nparams >= 3) {
                 uint16_t pct = (uint16_t)(params[0] | ((uint16_t)params[1] << 8)); // 0–500
                 uint8_t  durCode = params[2];
-                uint32_t dur_min = (durCode == 150u) ? 15u : (durCode == 160u) ? 30u : 0u;
+                uint32_t dur_min = (durCode == 150u) ? 15u : 30u;   // 150→15min, 160→30min, 其余默认30
                 float ref = (g_pump_state.current_basal_rate > 0.0f)
                             ? g_pump_state.current_basal_rate : 0.5f;
                 g_pump_state.tbr_percent = (float)pct;
-                g_pump_state.tbr_rate    = (float)pct / 100.0f * ref;   // 绝对速率 U/h
+                g_pump_state.tbr_rate    = (float)pct / 100.0f * ref;   // 绝对速率 U/h (0%→0)
                 g_pump_state.tbr_expiry_ms = millis() + dur_min * 60000UL;
-                /* ★ 2026-08-11: 记 TEMP_START 历史, 供 AAPS 闭环读取时落 TBR 治疗账本 */
+                /* 记 TEMP_START 历史, 供 AAPS 闭环读取时落 TBR 治疗账本 */
                 aaps_dana_record_tbr(DANA_HIST_CODE_TEMP_START, dana_local_now(),
-                                     (uint16_t)pct, (uint16_t)dur_min);
+                                     pct, (uint16_t)dur_min);
+            }
+            break;
+        case DANA_CMD_SET_TBR: {         /* 0x60 手动 TBR (AAPS: [pct u8][durHours u8]) */
+            if (nparams >= 2) {
+                uint16_t pct = (uint16_t)params[0];                  // 0–255 (u8)
+                uint8_t  durHours = params[1];                       // 小时
+                uint32_t dur_min = (durHours > 0u) ? (uint32_t)durHours * 60u : 60u;
+                float ref = (g_pump_state.current_basal_rate > 0.0f)
+                            ? g_pump_state.current_basal_rate : 0.5f;
+                g_pump_state.tbr_percent = (float)pct;
+                g_pump_state.tbr_rate    = (float)pct / 100.0f * ref;   // 绝对速率 U/h (0%→0)
+                g_pump_state.tbr_expiry_ms = millis() + dur_min * 60000UL;
+                /* 记 TEMP_START 历史, 供 AAPS 闭环读取时落 TBR 治疗账本 */
+                aaps_dana_record_tbr(DANA_HIST_CODE_TEMP_START, dana_local_now(),
+                                     pct, (uint16_t)dur_min);
             }
             break;
         }
@@ -744,7 +766,8 @@ int aaps_dana_handle_command(dana_ctx_t *c, uint8_t opcode,
          * status 位：bit0=暂停 bit2=方波中 bit3=双波中 bit4=TBR 中 */
         case DANA_CMD_INITIAL_SCREEN: {
             uint8_t status = 0;
-            if (g_pump_state.tbr_percent > 0.0f)      status |= 0x10;
+            /* TBR 进行中: 以 tbr_expiry_ms 在未来判定(含 0% low-temp), 否则 AAPS 验证 isTempBasalInProgress 失败 */
+            if (millis() < g_pump_state.tbr_expiry_ms) status |= 0x10;
             if (basal_scheduler_extended_bolus_active()) status |= 0x04;
             resp[0]  = status;
             dana_put16(&resp[1],  (uint16_t)(g_pump_state.today_units_x100 & 0xFFFF)); // 今日总量 U×100
@@ -1371,6 +1394,9 @@ void aaps_dana_attach(void *server)
     fff2->setCallbacks(&g_dana_ch_cb);
 
     svc->start();
+
+    /* P2-9 补全: 把 TBR 历史记录钩子注册给 HAL, 使泵菜单设/取 TBR 也能进 0xC2 回放。 */
+    ui_hal_register_tbr_history_cb(aaps_tbr_hist_cb);
 }
 
 /* ============================================================

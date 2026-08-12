@@ -205,6 +205,16 @@ float ui_hal_basal_run_test(void)
     return basal_scheduler_run_daily_test();
 }
 
+// ---- TBR 历史记录钩子 (P2-9 补全): 泵菜单设/取 TBR 时通知 AAPS 协议层写入 0xC2 回放 ----
+// 初始为 NULL; aaps_dana_attach() 会注册 aaps_dana_record_tbr 的包装回调。
+// 这样泵本地菜单的 TBR 也能进 AAPS 治疗账本, 且不破坏 HAL ↔ 协议层的分层。
+static ui_hal_tbr_hist_cb_t s_tbr_hist_cb = NULL;
+
+void ui_hal_register_tbr_history_cb(ui_hal_tbr_hist_cb_t cb)
+{
+    s_tbr_hist_cb = cb;
+}
+
 void ui_hal_set_tbr(float percent, uint32_t duration_min)
 {
     if (percent <= 0.0f || duration_min == 0) { ui_hal_cancel_tbr(); return; }
@@ -218,6 +228,8 @@ void ui_hal_set_tbr(float percent, uint32_t duration_min)
     // 执行历史: TBR 开始
     basal_history_record(BH_TBR_START, g_pump_config.active_profile, g_pump_state.loop_mode,
                          (uint16_t)(percent * 10.0f), (uint16_t)(g_pump_state.tbr_rate * 100.0f));
+    // AAPS 0xC2 回放: 把菜单 TBR 也写进历史缓冲 (BLE 路径在 0x60/0xC1 handler 直接记, 此处补菜单路径)
+    if (s_tbr_hist_cb) s_tbr_hist_cb(UI_HAL_TBR_EVENT_START, (uint16_t)percent, (uint16_t)duration_min);
 }
 
 void ui_hal_cancel_tbr(void)
@@ -229,6 +241,8 @@ void ui_hal_cancel_tbr(void)
     g_pump_state.tbr_percent = 0;
     g_pump_state.tbr_rate    = 0;
     g_pump_state.tbr_expiry_ms = 0;
+    // AAPS 0xC2 回放: 菜单取消 TBR 也写停止事件
+    if (s_tbr_hist_cb) s_tbr_hist_cb(UI_HAL_TBR_EVENT_STOP, 0, 0);
 }
 
 // P3-13: 板载温度读取 (过温检测源)

@@ -22,6 +22,7 @@
 #include "aaps_dana.h"      // 真实协议常量 + 信封 API (extern "C")
 #include "pump_state.h"     // g_pump_state (真实结构体)
 #include "rtc_clock.h"      // rtc_clock_init / rtc_unix_now / rtc_is_set (真实固件实现)
+#include "ui_hal.h"         // ui_hal_set_tbr / cancel_tbr / TBR 历史钩子 (P2-9 菜单 TBR 回归)
 #include "host_glue.h"      // 假硬件层 (电机/基础率记录, host_state_init)
 #include "NimBLEDevice.h"   // 假 NimBLE (host_drain_tx / NimBLEServer)
 
@@ -202,12 +203,23 @@ static void run_scripted(void)
     CHECK(g_pump_state.tbr_percent == 0.0f, "tbr_percent 归零");
     CHECK(g_pump_state.tbr_rate == 0.0f, "tbr_rate 归零");
 
-    /* ---- 9. SET_TBR (0x60) 手动 TBR=50% / 30min ---- */
-    printf("\n[9] SET_TBR (0x60) 手动 TBR=50%% / 30min\n");
-    uint8_t tbr2[3] = { 50 & 0xFF, 0, 160 };
-    r = send_cmd(DANA_CMD_SET_TBR, tbr2, 3);
+    /* ---- 9. SET_TBR (0x60) 手动 TBR=50% / 1h (AAPS 真实格式: [pct u8][durHours u8]) ---- */
+    printf("\n[9] SET_TBR (0x60) 手动 TBR=50%% / 1h (真实 2 字节布局)\n");
+    uint8_t tbr2[2] = { 50 & 0xFF, 1 };   // pct=50, durHours=1 -> 60min
+    r = send_cmd(DANA_CMD_SET_TBR, tbr2, 2);
     CHECK(r == 1, "SET_TBR 收到响应");
     CHECK(g_pump_state.tbr_percent == 50.0f, "tbr_percent=50");
+    CHECK(g_pump_state.tbr_expiry_ms > millis(), "tbr_expiry_ms 在未来(60min)");
+
+    /* ---- 9b. SET_TBR (0x60) 0% low-temp / 1h —— 复现用户实测失败场景 ---- */
+    printf("\n[9b] SET_TBR (0x60) 0%% low-temp / 1h (复现 10:44 报错场景)\n");
+    uint8_t tbr0[2] = { 0, 1 };   // pct=0, durHours=1
+    r = send_cmd(DANA_CMD_SET_TBR, tbr0, 2);
+    CHECK(r == 1, "SET_TBR 收到响应");
+    CHECK(g_pump_state.tbr_percent == 0.0f, "tbr_percent=0 (low-temp)");
+    CHECK(g_pump_state.tbr_rate == 0.0f, "tbr_rate=0 (基础率降到 0)");
+    CHECK(g_pump_state.tbr_expiry_ms > millis(),
+          "tbr_expiry_ms 在未来 → TBR 位置位, AAPS 验证 isTempBasalInProgress 通过");
 
     /* ---- 10. STEP_BOLUS_START (0x4A) 2.0U ---- */
     printf("\n[10] STEP_BOLUS_START (0x4A) 大剂量 2.0U\n");
@@ -432,6 +444,68 @@ static void run_scripted(void)
         CHECK(found_tstart, "回放含注入的 TEMP_START 记录(100%/30min)");
         CHECK(found_ext, "回放含注入的 EXT_START 记录(0.5U/60min 方波)");
         CHECK(n_end == 1, "回放以 0xFF 结束标记收尾");
+    }
+
+    /* ---- 19. P2-9 补全回归: 泵菜单设 TBR 也必须进 0xC2 回放 ----
+     * 根因: ui_hal_set_tbr/cancel_tbr 原先只写泵屏历史, 不喂 AAPS 回放缓冲,
+     *       → 泵本地菜单设的 TBR AAPS 永远看不到(与 BLE 0x60/0xC1 路径不一致)。
+     * 修复: ui_hal_set_tbr/cancel_tbr 经 ui_hal_register_tbr_history_cb 钩子
+     *       把 TEMP_START/TEMP_STOP 事件写入 0xC2 回放缓冲。
+     * 此处注册"真实记录钩子"(直接落 aaps_dana_record_tbr), 调 ui_hal_set_tbr 模拟
+     * 菜单设 120%/45min, 再发 0xC2 回放, 断言 TEMP_START(120%/45min) 真出现在回放里。 */
+    printf("\n[19] P2-9 补全: 泵菜单设 TBR 经 ui_hal 钩子进 0xC2 回放\n");
+    {
+        /* 注册真实记录钩子: 菜单路径的事件直接写入 AAPS 回放缓冲 */
+        ui_hal_register_tbr_history_cb([](uint8_t code, uint16_t pct, uint16_t dur) {
+            aaps_dana_record_tbr(code, rtc_unix_now(), pct, dur);
+        });
+        ui_hal_set_tbr(120.0f, 45);        // 模拟菜单设 120% / 45min
+        bool found_menu_tstart = false;
+        {
+            uint8_t from[6] = { 0, 1, 1, 0, 0, 0 };   // load-all
+            uint8_t pkt[SIM_PKT_CAP]; size_t pl = 0;
+            int apply_ble5 = (c_peer.conn == DANA_CONN_HANDSHAKE_DONE) ? 1 : 0;
+            int br = dana_build_packet(&c_peer, pkt, &pl, DANA_TYPE_COMMAND,
+                                       DANA_CMD_APS_HISTORY_EVENTS, from, 6, apply_ble5);
+            CHECK(br == 0, "0xC2 请求包构建成功(菜单 TBR 回放)");
+            aaps_dana_feed_rx_test(pkt, pl);
+            aaps_dana_pump();
+            uint8_t rx[SIM_PKT_CAP]; size_t rl;
+            while ((rl = host_drain_tx(rx, sizeof(rx))) > 0) {
+                uint8_t t, op, pr[SIM_PARAM_CAP]; size_t np = 0;
+                int ur = dana_unpack_packet(&c_peer, rx, rl, &t, &op, pr, sizeof(pr), &np);
+                if (ur != 0) continue;
+                if (op != DANA_CMD_APS_HISTORY_EVENTS) continue;
+                if (np >= 11 && pr[2] == DANA_HIST_CODE_TEMP_START) {
+                    uint16_t pct = (uint16_t)((pr[7] << 8) | pr[8]);
+                    uint16_t dur = (uint16_t)((pr[9] << 8) | pr[10]);
+                    if (pct == 120 && dur == 45) found_menu_tstart = true;
+                }
+            }
+        }
+        CHECK(found_menu_tstart,
+              "菜单 ui_hal_set_tbr(120%/45min) → 0xC2 回放含 TEMP_START(120%/45min) ← P2-9 修复核心");
+        /* 取消路径同样应记录 TEMP_STOP */
+        ui_hal_cancel_tbr();
+        bool found_menu_tstop = false;
+        {
+            uint8_t from[6] = { 0, 1, 1, 0, 0, 0 };
+            uint8_t pkt[SIM_PKT_CAP]; size_t pl = 0;
+            int apply_ble5 = (c_peer.conn == DANA_CONN_HANDSHAKE_DONE) ? 1 : 0;
+            dana_build_packet(&c_peer, pkt, &pl, DANA_TYPE_COMMAND,
+                              DANA_CMD_APS_HISTORY_EVENTS, from, 6, apply_ble5);
+            aaps_dana_feed_rx_test(pkt, pl);
+            aaps_dana_pump();
+            uint8_t rx[SIM_PKT_CAP]; size_t rl;
+            while ((rl = host_drain_tx(rx, sizeof(rx))) > 0) {
+                uint8_t t, op, pr[SIM_PARAM_CAP]; size_t np = 0;
+                dana_unpack_packet(&c_peer, rx, rl, &t, &op, pr, sizeof(pr), &np);
+                if (op != DANA_CMD_APS_HISTORY_EVENTS) continue;
+                if (np >= 3 && pr[2] == DANA_HIST_CODE_TEMP_STOP) found_menu_tstop = true;
+            }
+        }
+        CHECK(found_menu_tstop, "菜单 ui_hal_cancel_tbr() → 0xC2 回放含 TEMP_STOP ← P2-9 修复核心");
+        ui_hal_register_tbr_history_cb(nullptr);   // 复位钩子, 避免影响后续交互模式
     }
 
     printf("\n========== 脚本化会话结束 ==========\n");

@@ -76,6 +76,19 @@ void    ui_hal_set_tbr(float percent, uint32_t duration_min);
 // 取消临时基础率 (percent/rate 归零)
 void    ui_hal_cancel_tbr(void);
 
+// ---- TBR 历史记录回调钩子 (P2-9 补全: 泵菜单设/取 TBR 也必须进 AAPS 0xC2 回放) ----
+// 背景: AAPS 只在 0xC2 历史回放里看到 TBR 事件。原实现只在 BLE 的 0x60/0xC1/0x62
+//       handler 里调 aaps_dana_record_tbr, 而泵本地菜单(SCR_TBR)经 ui_hal_set_tbr/
+//       cancel_tbr 设 TBR 时只写泵屏历史, 不喂 AAPS 回放缓冲 → AAPS 看不到菜单 TBR。
+// 做法: HAL 层暴露一个钩子, 由 AAPS/Dana 协议层(aaps_dana.cpp)在初始化时注册;
+//       ui_hal_set_tbr/cancel_tbr 在落状态时顺带触发钩子。HAL 不反向依赖协议层。
+// 回调参数 code: 1=TEMP_START / 2=TEMP_STOP (必须与 aaps_dana DANA_HIST_CODE_TEMP_* 一致)
+// 中性常量, 避免 HAL 反向依赖 Dana 协议层头文件。
+#define UI_HAL_TBR_EVENT_START 1u   // = DANA_HIST_CODE_TEMP_START
+#define UI_HAL_TBR_EVENT_STOP  2u   // = DANA_HIST_CODE_TEMP_STOP
+typedef void (*ui_hal_tbr_hist_cb_t)(uint8_t code, uint16_t percent, uint16_t dur_min);
+void    ui_hal_register_tbr_history_cb(ui_hal_tbr_hist_cb_t cb);
+
 // ============================================================
 // 2. 动作 (菜单触发, 真实生效)
 // ============================================================
