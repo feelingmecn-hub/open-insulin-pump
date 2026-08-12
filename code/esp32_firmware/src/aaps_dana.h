@@ -95,6 +95,14 @@ extern "C" {
 #define DANA_CMD_SET_UTC_TZ       0x79u   // 设置泵 UTC 时间 + 时区偏移
 #define DANA_CMD_APS_TBR          0xC1u   // APS 临时基础率（闭环专用）
 #define DANA_CMD_APS_HISTORY_EVENTS 0xC2u // APS 历史事件（必须以 0xFF 结束，否则 AAPS 死等）
+
+/* AAPS 历史事件记录码 (对齐 DanaPump.HistoryEntry), 供 0xC2 回放布局使用 */
+#define DANA_HIST_CODE_TEMP_START 1u
+#define DANA_HIST_CODE_TEMP_STOP  2u
+#define DANA_HIST_CODE_EXT_START  3u
+#define DANA_HIST_CODE_EXT_STOP   4u
+#define DANA_HIST_CODE_BOLUS      5u
+#define DANA_HIST_CODE_DUAL_BOLUS 6u
 #define DANA_CMD_APS_SET_EVENT_HISTORY 0xC3u
 #define DANA_CMD_SET_HISTORY_SAVE 0xE0u
 #define DANA_CMD_KEEP_CONNECTION  0xFFu   // 保活（data[0] 必须为 0）
@@ -233,6 +241,15 @@ void aaps_notify_bolus_progress(uint16_t delivered_x100);
 void aaps_notify_bolus_complete(void);
 /* 报警主动推送 (DANA_NOTIFY_ALARM) */
 void aaps_notify_alarm(uint8_t alarm_code);
+
+/* ---- AAPS 历史事件历史 (APS_HISTORY_EVENTS 0xC2) ----
+ * AAPS 仅在读取本命令回放的 BOLUS / TEMP_START / TEMP_STOP 记录时, 才把大剂量/临时基础率
+ * 写进自己的治疗账本 (pumpSync.syncBolusWithPumpId 等)。此前固件对 0xC2 只回 0xFF,
+ * 导致大剂量控制成功但 AAPS「治疗-碳水与大剂量」永远不记账(闭环下 IOB 算少→低血糖风险)。
+ * 这里维护一个环形历史缓冲, 在大剂量完成 / TBR 变更时追加记录, 0xC2 时按 from 时间戳回放
+ * (Dana-i 走 UTC 11 字节布局), 末尾补 0xFF。 */
+void aaps_dana_record_bolus(uint32_t ts, uint16_t amount_x100);
+void aaps_dana_record_tbr(uint8_t code, uint32_t ts, uint16_t percent, uint16_t dur_min);
 
 /* 异步发送泵：在 loop() 上下文调用，把 onWrite 入队的响应按 MTU 分包 notify 发出。
  * 避免在 NimBLE 写回调内同步 notify 被栈丢弃（连上但 AAPS 永收不到响应、2 分钟超时断开的根因）。

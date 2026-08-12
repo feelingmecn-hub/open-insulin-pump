@@ -13,6 +13,7 @@
 #include "history_log.h"
 #include "dose_log.h"      // 大剂量完成记入剂量追溯日志
 #include "storage.h"
+#include "rtc_clock.h"     // P1-6 修复: 大剂量完成时写入真实时戳 (rtc_unix_now)
 #include "iob_model.h"     // IOB 衰减模型 (替代 iob_x10000 只增不减)
 
 #ifdef USE_AAPS_DANA
@@ -327,6 +328,15 @@ static void motor_deliver_bolus(float total_units, uint8_t kind, bool as_basal_t
             aaps_notify_bolus_complete();
 #endif
             iob_record_bolus(actual);   // 整笔完成后记录一笔, 交给 iob_recompute 衰减
+            g_pump_state.last_bolus_time = rtc_unix_now();   // ★ 真实大剂量完成时刻(UTC秒), 供 0x40 回读/AAPS 用
+            /* ★ 2026-08-11: 记 BOLUS 历史, 供 AAPS 经 0xC2 回放后写治疗账本
+             *   (AAPS 仅在读到 BOLUS 记录时才 syncBolusWithPumpId → 否则治疗页永远空)。
+             *   回报量用最终 bolus_delivered_x100(完成对齐请求量/中断报真实量),
+             *   与 AAPS 经 0x40 回读/完成通知所见一致, 便于按量匹配 bolusType。 */
+#ifdef USE_AAPS_DANA
+            aaps_dana_record_bolus(g_pump_state.last_bolus_time,
+                                   (uint16_t)(g_pump_state.bolus_delivered_x100 & 0xFFFF));
+#endif
             g_pump_config.total_bolus_count++;
             history_log_event(EVENT_TYPE_BOLUS, ALARM_NONE, ax100, (uint16_t)kind);
             dose_log_append(EVENT_TYPE_BOLUS, ax100, (uint16_t)kind, 0);

@@ -4,6 +4,32 @@
 
 ---
 
+## 2026-08-12 — AAPS 历史事件(0xC2)回放修复：治疗页全量记账（大剂量/TBR/方波）
+
+> 用户实测：修复前 AAPS 里**所有对泵的操作记录（大剂量/临时基础率/方波）都看不到**——治疗-碳水与大剂量页永远空。根因：固件对 `0xC2`(APS_HISTORY_EVENTS) 历来只回 `0xFF`、从不回放历史记录，而 AAPS 仅在 `loadEvents()` 读回 BOLUS/TEMP/EXTENDED 记录时才 `syncXxxWithPumpId` 写账本。已真机验证修复。
+
+### ① 根因（AAPS 源码坐实）
+- AAPS `DanaRSService` 在**每个操作后**都调 `loadEvents()`（大剂量 / TBR / 方波 / 双波 …），发 `0xC2` 读泵历史事件；`DanaRSPacketAPSHistoryEvents.processMessage()` 从回放记录里按 code `syncBolusWithPumpId`/`syncTemporaryBasalWithPumpId`/`syncExtendedBolusWithPumpId` 写出治疗记录。
+- 固件旧实现 `0xC2` handler 只回 `0xFF`，一条记录都不回放 → AAPS 收不到任何 EVENT → **所有泵操作都不进 AAPS 账本/历史/日志**。
+- 推翻前置错误推论：此前「治疗页空 ⟹ 非 AAPS 所发 ⟹ 来自伴生 App/按键残留」以及「0x40 last_bolus_time 乱跳导致不记账」均不成立（已读 `DanaRSPacketBolusGetStepBolusInformation` 确认 0x40 处理器根本不用返回日期，只用 `DateTime.now()`）。
+
+### ② 修复：历史回放子系统（新增，`aaps_dana.cpp`）
+- 环形缓冲 `g_hist[48]` + 稳定唯一 `id(1–2000)`；大剂量完成 / TBR 下发 / 取消 TBR / 方波起停 时分别 `aaps_dana_record_bolus()` / `aaps_dana_record_tbr()` 写入。
+- `dana_history_replay(from)`：按 from 时间戳**增量回放**（UTC 11B 布局：`id[0..1]`/`code[2]`/`Unix秒[3..6]`/`param1[7..8]`/`param2[9..10]`，MSB），每条作为独立 `RESPONSE(0xC2)` 入队，**末尾补 `0xFF`**（不补 AAPS `loadEvents()` 死等直到断连）。
+- 仅回放 AAPS 已知 code（BOLUS=5 / TEMP_START=1 / TEMP_STOP=2 / EXT_START=3 / EXT_STOP=4 / DUAL=6 …），避免未知 code 触发 `fromInt()` 异常中断整批。
+- `DANA_TXQ_SLOTS` **32 → 64**：防首次全量回放 48+1 包溢出丢 `0xFF`。
+
+### ③ 时区与字节布局核对（无误）
+- 记录 `ts` 走 `dana_local_now()`（RTC 设好后 = `rtc_unix_now()` 真 UTC，无 +8h）；`from_ts` 用 `rtc_ymdhms_to_unix()` 把 AAPS 发来的 **UTC** 6 分量重建 → 两边皆真 UTC，增量过滤自洽；id 稳定使 AAPS `pumpId=datetime*2+id` 去重正确，重复连接不重复建账。
+
+### ④ 验证
+- 主机联调（真实固件 `aaps_dana.cpp` 命令分发代码）**PASS=67 FAIL=0**（新增 [18] 0xC2 回放 BOLUS/TEMP/EXT 历史回归）。
+- ESP32 全量固件编译成功（v10_debug，1,221,321B）。
+- **真机验证（2026-08-12）**：烧录 v10_debug 后用户手动打 0.5U；logcat 铁证 `**NEW** EVENT BOLUS (5) 2026/8/12 08:26 Bolus: 0.5U`（pumpId=3572988762001, newRecord=true）→ 治疗页成功写入，时间戳正确，剂量零误差。后续回放同条不带 NEW = pumpId 去重（正常）。
+- TBR/方波本次未实测（仅测 BOLUS），钩子已接 + 主机联调验过回放，走同路径。
+
+---
+
 ## 2026-08-11 — AAPS 大剂量「已输注」记账修复 + 联调验证文档
 
 > 用户实测 AAPS 大剂量：先报「已输注 0.00U」(notify 全丢)，再实测 10U 报「已输注 9.92U ≠ 请求 10.00U」。两处根因不同，均已修复；并经 logcat 坐实泵连接/握手/状态读取 100% 正常。

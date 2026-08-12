@@ -367,6 +367,73 @@ static void run_scripted(void)
     CHECK(r == 1 && g_rt_nparams == 17, "INITIAL_SCREEN 仍返回 17 字节标准布局");
     dump_state();
 
+    /* ---- 18. 修复回归: APS_HISTORY_EVENTS (0xC2) 必须回放 BOLUS/TEMP/EXT 记录 ----
+     * 根因: 此前固件对 0xC2 只回 0xFF 不回放任何记录 → AAPS 读不到任何泵事件
+     *       → 大剂量/临时基础率/方波 控制成功却永不写治疗账本 (IOB 漏记, 闭环低血糖风险)。
+     *       用户实测"所有 AAPS 操作泵的记录都看不到"正是此因(0xC2 历史回放缺失)。
+     * 此处注入三条历史(一笔 0.1U 大剂量 + 一次 100%/30min TBR + 一次 0.5U/60min 方波),
+     * 然后发 0xC2 (from=load-all), 抽回全部响应包逐条解包, 断言:
+     *   · 存在 BOLUS 记录(code=5) 且 amount×100 正确、时间戳正确;
+     *   · 存在 TEMP_START 记录(code=1) 且百分比/时长正确;
+     *   · 存在 EXT_START 记录(code=3) 且 amount×100/时长正确;
+     *   · 末尾有 0xFF 结束标记;
+     *   · 所有记录 code 均为 AAPS 已知值(否则 processMessage 会抛异常中断整批)。 */
+    printf("\n[18] 修复回归: APS_HISTORY_EVENTS (0xC2) 回放 BOLUS/TEMP/EXT 历史\n");
+    uint32_t bolus_ts = rtc_unix_now();
+    aaps_dana_record_bolus(bolus_ts, 10);                 // 0.1U
+    aaps_dana_record_tbr(DANA_HIST_CODE_TEMP_START, bolus_ts + 5, 100, 30);
+    aaps_dana_record_tbr(DANA_HIST_CODE_EXT_START, bolus_ts + 10, 50, 60);  // 0.5U/60min 方波
+    {
+        uint8_t from[6] = { 0, 1, 1, 0, 0, 0 };          // load-all (公元2000)
+        uint8_t pkt[SIM_PKT_CAP]; size_t pl = 0;
+        int apply_ble5 = (c_peer.conn == DANA_CONN_HANDSHAKE_DONE) ? 1 : 0;
+        int br = dana_build_packet(&c_peer, pkt, &pl, DANA_TYPE_COMMAND,
+                                   DANA_CMD_APS_HISTORY_EVENTS, from, 6, apply_ble5);
+        CHECK(br == 0, "0xC2 请求包构建成功");
+        aaps_dana_feed_rx_test(pkt, pl);
+        aaps_dana_pump();                                 // 把所有响应包泵入 TX 流
+
+        int n_rec = 0, n_end = 0;
+        bool bad_code = false;
+        bool found_bolus = false, found_tstart = false, found_ext = false;
+        uint8_t rx[SIM_PKT_CAP];
+        size_t rl;
+        while ((rl = host_drain_tx(rx, sizeof(rx))) > 0) {
+            uint8_t t, op, pr[SIM_PARAM_CAP]; size_t np = 0;
+            int ur = dana_unpack_packet(&c_peer, rx, rl, &t, &op, pr, sizeof(pr), &np);
+            if (ur != 0) { bad_code = true; continue; }
+            if (op != DANA_CMD_APS_HISTORY_EVENTS) continue;
+            n_rec++;
+            if (np == 1 && pr[0] == 0xFF) { n_end++; continue; }
+            if (np >= 11) {
+                uint8_t code = pr[2];
+                /* 本固件仅可能产出 TEMP_START=1 TEMP_STOP=2 BOLUS=5
+                 * (及延展/双波 3/4/6); 其余 code 会让 AAPS processMessage 抛异常。 */
+                bool known = (code >= 1 && code <= 6);
+                if (!known) { bad_code = true; continue; }
+                if (code == DANA_HIST_CODE_BOLUS) {
+                    uint16_t amt = (uint16_t)((pr[7] << 8) | pr[8]);
+                    uint32_t ts  = ((uint32_t)pr[3] << 24) | ((uint32_t)pr[4] << 16) |
+                                   ((uint32_t)pr[5] << 8) | pr[6];
+                    if (amt == 10 && ts == bolus_ts) found_bolus = true;
+                } else if (code == DANA_HIST_CODE_TEMP_START) {
+                    uint16_t pct = (uint16_t)((pr[7] << 8) | pr[8]);
+                    uint16_t dur = (uint16_t)((pr[9] << 8) | pr[10]);
+                    if (pct == 100 && dur == 30) found_tstart = true;
+                } else if (code == DANA_HIST_CODE_EXT_START) {
+                    uint16_t amt = (uint16_t)((pr[7] << 8) | pr[8]);
+                    uint16_t dur = (uint16_t)((pr[9] << 8) | pr[10]);
+                    if (amt == 50 && dur == 60) found_ext = true;
+                }
+            }
+        }
+        CHECK(!bad_code, "所有 0xC2 记录均为 AAPS 已知 code (无未知 code 致异常)");
+        CHECK(found_bolus, "回放含注入的 BOLUS 记录(0.1U, 时间戳正确) ← 修复核心");
+        CHECK(found_tstart, "回放含注入的 TEMP_START 记录(100%/30min)");
+        CHECK(found_ext, "回放含注入的 EXT_START 记录(0.5U/60min 方波)");
+        CHECK(n_end == 1, "回放以 0xFF 结束标记收尾");
+    }
+
     printf("\n========== 脚本化会话结束 ==========\n");
 }
 

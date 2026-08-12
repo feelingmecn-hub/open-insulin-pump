@@ -325,8 +325,11 @@ static inline void dana_cfg_mark_dirty(void)
 /* ★ 2026-08-10 大剂量「已输注 0.00U」修复：扩容发送队列。
  * 大剂量期间每段都发一次进度 notify（2U≈20 段 → 约 20 个 Rate + 完成包），
  * 旧 8 槽在 BLE 流控/loop 取包稍慢时极易填满，把**关键的大剂量完成 notify 直接丢弃**
- * → AAPS 永远收不到 bolusDone → 超时记 0.00U。扩到 32 槽留足余量。 */
-#define DANA_TXQ_SLOTS 32
+ * → AAPS 永远收不到 bolusDone → 超时记 0.00U。扩到 32 槽留足余量。
+ * 2026-08-11 再扩到 64：首次连接 AAPS 会一次性回放全部历史事件(0xC2 回放 N 条记录
+ * + 1 个 0xFF 结束符)，历史环最多 48 条 → 最多 49 包；若队列 < 49 溢出会丢弃末尾 0xFF
+ * 致 AAPS 死等超时。64 槽可安全承载完整首读。 */
+#define DANA_TXQ_SLOTS 64
 static uint8_t g_txq[DANA_TXQ_SLOTS][DANA_MAX_PACKET];
 static size_t  g_txq_len[DANA_TXQ_SLOTS];
 static int     g_txq_head = 0, g_txq_tail = 0;
@@ -469,6 +472,84 @@ static void dana_send_packet(uint8_t type, uint8_t opcode,
     size_t  bl = 0;
     if (dana_build_packet(&g_dana_ctx, buf, &bl, type, opcode, params, nparams, ble5) == 0)
         dana_send_raw(buf, bl);
+}
+
+/* ===== AAPS 历史事件历史缓冲 (供 0xC2 APS_HISTORY_EVENTS 回放) =====
+ * 记录码对齐 DanaPump.HistoryEntry (常量见 aaps_dana.h DANA_HIST_CODE_*):
+ *   TEMP_START=1 TEMP_STOP=2 EXTENDED_START=3 EXTENDED_STOP=4 BOLUS=5 DUAL_BOLUS=6
+ * Dana-i (hwModel>=7 → usingUTC=true) 按 UTC 11 字节布局解析 (DanaRSPacketAPSHistoryEvents):
+ *   [0..1] id(MSB,1-2000 稳定唯一) [2] recordCode [3..6] Unix秒(MSB,4B)
+ *   [7..8] param1(MSB,2B) [9..10] param2(MSB,2B)
+ * AAPS 用 pumpId = datetime*2 + id 去重, 故同一记录重读须返回相同 id (id 入环存于记录)。
+ * 大剂量/方波立即量: param1=量×100; TBR/方波: param1=百分比或量×100, param2=时长(分)。
+ * 已接记录钩子: BOLUS(motor完成) TEMP_START/TEMP_STOP(0xC1/0x60/0x62) EXT_START/EXT_STOP(0x47/0x49,含0x48双波延展量)。 */
+typedef struct {
+    uint8_t  used;
+    uint8_t  code;
+    uint32_t ts;     // Unix 秒 (UTC)
+    uint16_t p1;     // param1(MSB): 大剂量=量×100; TBR=百分比
+    uint16_t p2;     // param2(MSB): TBR=时长(分)
+    uint16_t id;     // 1..2000 稳定唯一
+} dana_hist_t;
+#define DANA_HIST_MAX 48
+static dana_hist_t g_hist[DANA_HIST_MAX];
+static int         g_hist_head = 0;
+static uint16_t    g_hist_id = 1;
+
+static void dana_history_add(uint8_t code, uint32_t ts, uint16_t p1, uint16_t p2)
+{
+    dana_hist_t *h = &g_hist[g_hist_head];
+    h->used = 1;
+    h->code = code;
+    h->ts   = ts;
+    h->p1   = p1;
+    h->p2   = p2;
+    h->id   = g_hist_id;
+    g_hist_id = (g_hist_id >= 2000u) ? 1u : (uint16_t)(g_hist_id + 1u);
+    g_hist_head = (g_hist_head + 1) % DANA_HIST_MAX;
+}
+
+void aaps_dana_record_bolus(uint32_t ts, uint16_t amount_x100)
+{
+    dana_history_add(DANA_HIST_CODE_BOLUS, ts, amount_x100, 0);
+}
+
+void aaps_dana_record_tbr(uint8_t code, uint32_t ts, uint16_t percent, uint16_t dur_min)
+{
+    dana_history_add(code, ts, percent, dur_min);
+}
+
+/* 把 from(UTC 6 字节: 年-2000,月,日,时,分,秒) 之后的记录逐条回放, 末尾补 0xFF。
+ * 每条记录作为独立 RESPONSE(0xC2) 包入队(异步发送), AAPS 缓冲后于 0xFF 统一处理。
+ * from 为 AAPS 首读的特例 (0,1,1,0,0,0 → 公元2000) 时 from_ts=0, 回放全部。 */
+static void dana_history_replay(const uint8_t *from6)
+{
+    uint32_t from_ts = 0;
+    if (from6 && (from6[0] != 0 || from6[1] != 1 || from6[2] != 1 ||
+                  from6[3] != 0 || from6[4] != 0 || from6[5] != 0)) {
+        from_ts = rtc_ymdhms_to_unix((int)from6[0] + 2000, (int)from6[1], (int)from6[2],
+                                     (int)from6[3], (int)from6[4], (int)from6[5]);
+    }
+    for (int i = 0; i < DANA_HIST_MAX; i++) {
+        dana_hist_t *h = &g_hist[i];
+        if (!h->used) continue;
+        if (h->ts < from_ts) continue;          // 仅回放 from 之后的增量
+        uint8_t rec[11];
+        rec[0] = (uint8_t)(h->id >> 8);
+        rec[1] = (uint8_t)(h->id & 0xFF);
+        rec[2] = h->code;
+        rec[3] = (uint8_t)(h->ts >> 24);
+        rec[4] = (uint8_t)(h->ts >> 16);
+        rec[5] = (uint8_t)(h->ts >> 8);
+        rec[6] = (uint8_t)(h->ts & 0xFF);
+        rec[7] = (uint8_t)(h->p1 >> 8);
+        rec[8] = (uint8_t)(h->p1 & 0xFF);
+        rec[9] = (uint8_t)(h->p2 >> 8);
+        rec[10] = (uint8_t)(h->p2 & 0xFF);
+        dana_send_packet(DANA_TYPE_RESPONSE, DANA_CMD_APS_HISTORY_EVENTS, rec, 11, 1);
+    }
+    uint8_t end[1] = { 0xFF };
+    dana_send_packet(DANA_TYPE_RESPONSE, DANA_CMD_APS_HISTORY_EVENTS, end, 1, 1);
 }
 
 /* 泵→手机主动通知（大剂量进度/完成/报警）。命令阶段走 BLE5。 */
@@ -628,6 +709,9 @@ int aaps_dana_handle_command(dana_ctx_t *c, uint8_t opcode,
                 g_pump_state.tbr_percent = (float)pct;
                 g_pump_state.tbr_rate    = (float)pct / 100.0f * ref;   // 绝对速率 U/h
                 g_pump_state.tbr_expiry_ms = millis() + dur_min * 60000UL;
+                /* ★ 2026-08-11: 记 TEMP_START 历史, 供 AAPS 闭环读取时落 TBR 治疗账本 */
+                aaps_dana_record_tbr(DANA_HIST_CODE_TEMP_START, dana_local_now(),
+                                     (uint16_t)pct, (uint16_t)dur_min);
             }
             break;
         }
@@ -635,6 +719,8 @@ int aaps_dana_handle_command(dana_ctx_t *c, uint8_t opcode,
             g_pump_state.tbr_percent = 0;
             g_pump_state.tbr_rate    = 0;
             g_pump_state.tbr_expiry_ms = 0;
+            /* ★ 2026-08-11: 记 TEMP_STOP 历史, 闭环取消 TBR 时 AAPS 能正确结束 TBR 记录 */
+            aaps_dana_record_tbr(DANA_HIST_CODE_TEMP_STOP, dana_local_now(), 0, 0);
             break;
 
         case DANA_CMD_EXT_BOLUS:         /* 0x47 方波大剂量 */
@@ -643,10 +729,15 @@ int aaps_dana_handle_command(dana_ctx_t *c, uint8_t opcode,
                 uint8_t  halfHours = params[2];                                    // 1–16 → 0.5–8h
                 float duration_h = (float)halfHours * 0.5f;
                 basal_scheduler_start_extended_bolus((float)amt / 100.0f, duration_h, 0);
+                /* ★ 2026-08-12: 记 EXT_START 历史, 供 AAPS 落方波治疗账本 */
+                aaps_dana_record_tbr(DANA_HIST_CODE_EXT_START, dana_local_now(),
+                                     amt, (uint16_t)(halfHours * 30u));
             }
             break;
         case DANA_CMD_EXT_BOLUS_CANCEL:  /* 0x49 */
             basal_scheduler_cancel_extended_bolus();
+            /* ★ 2026-08-12: 记 EXT_STOP 历史, AAPS 能正确结束方波记录 */
+            aaps_dana_record_tbr(DANA_HIST_CODE_EXT_STOP, dana_local_now(), 0, 0);
             break;
 
         /* ---- 0x02 INITIAL_SCREEN_INFORMATION → 17B（protocol≥10 读到 [15]） ----
@@ -687,8 +778,18 @@ int aaps_dana_handle_command(dana_ctx_t *c, uint8_t opcode,
             resp[0] = 0x00;                                   // error = 0（非 0 会 failed）
             resp[1] = motor_bolus_active() ? 0x01 : 0x00;     // bolusType
             dana_put16(&resp[2], last);                       // initialBolusAmount
-            resp[4] = (uint8_t)ch;                            // 最后一次大剂量时刻（时）
-            resp[5] = (uint8_t)cmi;                           //                    （分）
+            // ★ 2026-08-11 修复：回填"上次大剂量时刻"必须用真实发生时间, 不能用当前时钟。
+            //   旧实现填 dana_local_now() 的时/分, 导致 AAPS 每次读 0x40 都以为"刚打了针"
+            //   (时刻永远=now) → 持续触发 bolus snooze 并污染 IOB 判定。last_bolus_time
+            //   在大剂量完成时由 motor_controller 写入 (rtc_unix_now, 与 dana_local_now 同源)。
+            if (g_pump_state.last_bolus_time != 0) {
+                int _y, _mo, _d, _h, _mi, _s;
+                rtc_unix_to_ymdhms(g_pump_state.last_bolus_time, &_y, &_mo, &_d, &_h, &_mi, &_s);
+                resp[4] = (uint8_t)_h;                        // 最后一次大剂量时刻（时, 真实）
+                resp[5] = (uint8_t)_mi;                       //                    （分, 真实）
+            } else {
+                resp[4] = 0; resp[5] = 0;
+            }
             dana_put16(&resp[6], last);                       // lastBolusAmount
             dana_put16(&resp[8], dana_u100(g_pump_config.max_bolus_single));
             resp[10] = 10;                                    // bolusStep = 0.10U
@@ -717,6 +818,9 @@ int aaps_dana_handle_command(dana_ctx_t *c, uint8_t opcode,
                 }
                 if (ext > 0) {
                     basal_scheduler_start_extended_bolus((float)ext / 100.0f, duration_h, BOLUS_DUAL);
+                    /* ★ 2026-08-12: 双波的延展量记 EXT_START 历史 (立即量已走 BOLUS 记录) */
+                    aaps_dana_record_tbr(DANA_HIST_CODE_EXT_START, dana_local_now(),
+                                         ext, (uint16_t)(halfHours * 30u));
                 }
             }
             break;
@@ -1013,14 +1117,15 @@ int aaps_dana_handle_command(dana_ctx_t *c, uint8_t opcode,
         /* ---- 0xC2 APS_HISTORY_EVENTS ----
          * AAPS 逐条接收，首字节 0xFF 代表「最后一条」→ 置 historyDoneReceived。
          * loadEvents() 里是 `while (!historyDoneReceived && isConnected) sleep(100)` 的
-         * **死等循环**，不回 0xFF 就永远卡在「读取泵历史」直到断连。
-         * 本机历史由自身 UI 维护，不向 AAPS 回放 → 直接回一条结束标记。
-         * ⚠️ 切勿回自造记录：AAPS processMessage 里 HistoryEntry.fromInt() 对
-         *    未知 recordCode 会 throw InvalidParameterException。 */
+         * 死等循环，不回 0xFF 就永远卡在「读取泵历史」直到断连。
+         * ★ 修复(2026-08-11)：此前直接回 0xFF 不回放任何记录 → AAPS 读不到 BOLUS/TEMP_START
+         *   等事件 → 大剂量控制成功却永远不写治疗账本(IOB 漏记, 闭环低血糖风险)。
+         *   现在按 AAPS 下发的 from(UTC 6B) 增量回放历史记录, 末尾补 0xFF。
+         *   ⚠️ 仅用 DanaPump.HistoryEntry 已知 code(1/2/5...), 未知 code 会让 AAPS
+         *      processMessage 的 fromInt() throw InvalidParameterException 中断整批解析。 */
         case DANA_CMD_APS_HISTORY_EVENTS:
-            resp[0] = 0xFF;
-            rn = 1;
-            break;
+            dana_history_replay(params);   // 回放增量记录 + 末尾 0xFF, 均异步入队
+            return 0;                      // 响应已由 replay 发出, 跳过末尾通用发送
 
         default:
             /* 未识别命令：回足够长的零填充。
