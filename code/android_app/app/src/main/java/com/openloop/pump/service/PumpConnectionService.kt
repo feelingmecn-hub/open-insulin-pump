@@ -12,14 +12,17 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.work.WorkManager
 import com.openloop.pump.R
+import com.openloop.pump.ble.ConnectionState
 import com.openloop.pump.data.repository.CgmRepository
 import com.openloop.pump.data.repository.PreferencesRepository
 import com.openloop.pump.data.repository.PumpRepository
+import com.openloop.pump.domain.model.GlucoseReading
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.first
 import javax.inject.Inject
@@ -46,6 +49,26 @@ class PumpConnectionService : Service() {
         scope.launch {
             val addr = prefs.pairedAddress.first()
             if (addr != null) pumpRepo.connect(addr) else pumpRepo.startScan()
+        }
+        // 收到 xDrip 血糖即回传泵（AAPS 不下发血糖，此路为泵获取 CGM 的唯一来源）；
+        // 泵屏显示渲染由后续功能补全，此处先把数据管道打通并存入泵状态。
+        scope.launch {
+            cgmRepo.glucose.collect { reading ->
+                reading ?: return@collect
+                if (pumpRepo.connectionState.value is ConnectionState.Connected) {
+                    runCatching { pumpRepo.sendCgm(reading.mgdl, reading.trend.toCgmCode()) }
+                }
+            }
+        }
+        // 连接建立后立刻补推一次当前读数，避免等到下一跳(≤5min)。
+        scope.launch {
+            pumpRepo.connectionState.collect { state ->
+                if (state is ConnectionState.Connected) {
+                    cgmRepo.glucose.value?.let { r ->
+                        runCatching { pumpRepo.sendCgm(r.mgdl, r.trend.toCgmCode()) }
+                    }
+                }
+            }
         }
     }
 
@@ -80,4 +103,14 @@ class PumpConnectionService : Service() {
     companion object {
         const val NOTIF_ID = 1001
     }
+}
+
+/** 6 档趋势 → 固件五档显示码(-2..2)；UNKNOWN 归 0。 */
+private fun GlucoseReading.Trend.toCgmCode(): Int = when (this) {
+    GlucoseReading.Trend.RISING_FAST -> 2
+    GlucoseReading.Trend.RISING -> 1
+    GlucoseReading.Trend.FLAT -> 0
+    GlucoseReading.Trend.FALLING -> -1
+    GlucoseReading.Trend.FALLING_FAST -> -2
+    GlucoseReading.Trend.UNKNOWN -> 0
 }

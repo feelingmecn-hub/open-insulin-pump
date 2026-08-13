@@ -48,6 +48,13 @@ class PumpRepository @Inject constructor(
     suspend fun refreshStatus() = ble.refreshStatus()
 
     /**
+     * 回传血糖给泵（mg/dL + 五档趋势码 -2..2），供泵屏显示用。
+     * AAPS 协议不下发血糖，此路是泵获取 CGM 值的唯一来源（伴生 App 收 xDrip 后转发）。
+     * 纯显示数据，无安全/计费影响。
+     */
+    suspend fun sendCgm(mgdl: Int, trend: Int) = ble.sendCgm(mgdl, trend)
+
+    /**
      * 基础率验证测试（CONTROL 0x18）：让泵把当前激活方案 24 段的总量一次性打出。
      *
      * 用途：确认「基础率到底有没有写进泵、泵会不会真的驱动电机」。
