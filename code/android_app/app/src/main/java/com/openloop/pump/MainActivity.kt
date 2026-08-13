@@ -1,6 +1,7 @@
 package com.openloop.pump
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -12,6 +13,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
+import com.openloop.pump.service.PumpConnectionService
 import com.openloop.pump.ui.navigation.AppNavHost
 import com.openloop.pump.ui.theme.OpenLoopTheme
 import dagger.hilt.android.AndroidEntryPoint
@@ -25,6 +27,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         requestBlePermissions()
+        startPumpConnectionServiceIfNeeded()
         setContent {
             OpenLoopTheme {
                 Surface(
@@ -48,5 +51,15 @@ class MainActivity : ComponentActivity() {
             listOf(Manifest.permission.ACCESS_FINE_LOCATION)
         }.filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
         if (needed.isNotEmpty()) permLauncher.launch(needed.toTypedArray())
+    }
+
+    /**
+     * 打开 App 即确保前台连接服务在跑（连泵 + CGM 回传）。
+     * 服务已由 BootCompleteReceiver 在开机/重装时拉起；此处补覆盖"用户手动打开 App"的场景，
+     * 且对已在运行的服务幂等（系统复用同一 Service 实例，onStartCommand 再次调用无副作用）。
+     */
+    private fun startPumpConnectionServiceIfNeeded() {
+        val intent = Intent(this, PumpConnectionService::class.java)
+        ContextCompat.startForegroundService(this, intent)
     }
 }

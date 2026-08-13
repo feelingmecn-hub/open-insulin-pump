@@ -1,5 +1,6 @@
 package com.openloop.pump.ble
 
+import android.util.Log
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
@@ -35,6 +36,8 @@ import kotlinx.coroutines.withTimeoutOrNull
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.coroutines.resume
+
+private const val TAG = "PumpBleManager"
 
 /**
  * 泵 BLE 管理器 —— 封装扫描 / 连接 / GATT 读写 / Notify / 配对。
@@ -252,6 +255,7 @@ class PumpBleManager @Inject constructor(
                 BluetoothProfile.STATE_CONNECTED -> {
                     connectDeferred?.complete(true)
                     connectDeferred = null
+                    Log.i(TAG, "onConnectionStateChange CONNECTED (intentionalDisconnect=$intentionalDisconnect)")
                     // 连接成功后统一发现服务（onScanResult 路径此前不调 discoverServices 会卡 Connecting）
                     runCatching { g.discoverServices() }
                 }
@@ -260,6 +264,7 @@ class PumpBleManager @Inject constructor(
                     connectDeferred = null
                     discoverDeferred?.complete(false)
                     discoverDeferred = null
+                    Log.w(TAG, "onConnectionStateChange DISCONNECTED (intentionalDisconnect=$intentionalDisconnect, status=$status)")
                     if (intentionalDisconnect) {
                         runCatching { g.close() }
                         gatt = null
@@ -453,7 +458,10 @@ class PumpBleManager @Inject constructor(
     suspend fun sendCgm(mgdl: Int, trend: Int): Result<Unit> = withContext(Dispatchers.IO) {
         val char = cgmChar ?: return@withContext fail("未连接或未发现 CGM 特征")
         val payload = PumpProtocol.buildCgm(mgdl, trend)
-        writeWithAck(gatt ?: return@withContext fail("GATT 未就绪"), char, payload)
+        Log.i(TAG, "sendCgm mgdl=$mgdl trend=$trend -> CHAR_CGM")
+        val r = writeWithAck(gatt ?: return@withContext fail("GATT 未就绪"), char, payload)
+        Log.i(TAG, "sendCgm result=${if (r.isSuccess) "OK" else "FAIL:" + r.exceptionOrNull()?.message}")
+        r
     }
 
     /**
