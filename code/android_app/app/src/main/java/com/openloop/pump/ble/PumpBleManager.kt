@@ -31,6 +31,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.coroutines.resume
@@ -101,6 +102,13 @@ class PumpBleManager @Inject constructor(
     private var readDeferred: CompletableDeferred<ByteArray?>? = null
     private val bondListeners = mutableListOf<(Boolean) -> Unit>()
 
+    /**
+     * 是否为主动断开。true=用户/服务显式断开（需 close 释放 GATT）；
+     * false=链路意外掉线，此时 autoConnect=true 会让 Android 后台自动重连，
+     * 切勿 close()，否则取消 autoConnect 且拆掉与 AAPS 共用的 ACL。
+     */
+    private var intentionalDisconnect = false
+
     // ============================================================
     // 扫描
     // ============================================================
@@ -156,11 +164,19 @@ class PumpBleManager @Inject constructor(
 
     @SuppressLint("MissingPermission")
     private fun connect(device: BluetoothDevice) {
+        // 同手机上与 AAPS 共存：用 autoConnect=true 建立后台常驻连接，
+        // 不与 AAPS 的直连(connectGatt autoConnect=false)抢同一条 ACL——
+        // 两个 App 都直连会在连接建立/服务发现/绑定的瞬间互相竞态，间歇性互相挤掉。
+        if (_connectionState.value is ConnectionState.Connecting
+            || _connectionState.value is ConnectionState.Connected) {
+            return
+        }
         _connectionState.value = ConnectionState.Connecting
         connectDeferred = CompletableDeferred()
+        intentionalDisconnect = false
         try {
             gatt = device.connectGatt(
-                context, false, gattCallback, BluetoothDevice.TRANSPORT_LE
+                context, true, gattCallback, BluetoothDevice.TRANSPORT_LE
             )
         } catch (e: SecurityException) {
             _connectionState.value = ConnectionState.Error("连接被拒绝：${e.message}")
@@ -176,8 +192,14 @@ class PumpBleManager @Inject constructor(
             return@withContext false
         }
         connect(dev)
-        val connected = connectDeferred?.await() ?: false
-        if (!connected) return@withContext false
+        val connected = withTimeoutOrNull(20000) { connectDeferred?.await() } ?: false
+        if (!connected) {
+            // 首连超时：autoConnect=true 仍在后台持续重试，仅更新 UI 状态，不拆 gatt。
+            if (_connectionState.value == ConnectionState.Connecting) {
+                _connectionState.value = ConnectionState.Disconnected
+            }
+            return@withContext false
+        }
 
         // 发起配对以建立加密链路
         if (dev.bondState != BluetoothDevice.BOND_BONDED) {
@@ -194,6 +216,7 @@ class PumpBleManager @Inject constructor(
 
     @SuppressLint("MissingPermission")
     fun disconnect() {
+        intentionalDisconnect = true
         runCatching {
             gatt?.disconnect()
             gatt?.close()
@@ -237,10 +260,19 @@ class PumpBleManager @Inject constructor(
                     connectDeferred = null
                     discoverDeferred?.complete(false)
                     discoverDeferred = null
-                    runCatching { g.close() }
-                    gatt = null
-                    resetCharacteristics()
-                    _connectionState.value = ConnectionState.Disconnected
+                    if (intentionalDisconnect) {
+                        runCatching { g.close() }
+                        gatt = null
+                        resetCharacteristics()
+                        _connectionState.value = ConnectionState.Disconnected
+                    } else {
+                        // 非主动断开：autoConnect=true 已让 Android 后台自动重连，
+                        // 切勿 close()（会取消 autoConnect），仅更新状态并把特征置空，
+                        // 保留 gatt 句柄供重连复用。这样即使 AAPS 周期断连把 ACL 瞬断，
+                        // 伴生 App 也不拆链，AAPS 下次直连可稳定复用同一 ACL。
+                        resetCharacteristics()
+                        _connectionState.value = ConnectionState.Disconnected
+                    }
                 }
             }
         }
