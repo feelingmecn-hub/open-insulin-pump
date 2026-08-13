@@ -28,7 +28,10 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -107,10 +110,23 @@ class PumpBleManager @Inject constructor(
 
     /**
      * 是否为主动断开。true=用户/服务显式断开（需 close 释放 GATT）；
-     * false=链路意外掉线，此时 autoConnect=true 会让 Android 后台自动重连，
-     * 切勿 close()，否则取消 autoConnect 且拆掉与 AAPS 共用的 ACL。
+     * false=链路意外掉线（AAPS 周期断连或信号丢失），同样关闭本端 GATT，
+     * 但底层 ACL 由 Android 在 AAPS 仍持有时保留，不拆。
      */
     private var intentionalDisconnect = false
+
+    /** 首次连接成功后缓存的泵 MAC，供后续按需重连（CGM 推送时若链路空闲可重新连上）。 */
+    private var targetAddress: String? = null
+
+    /** CGM 推送后的空闲释放计时器：到点且仍空闲则主动断开，把链路让给 AAPS。 */
+    private var releaseJob: Job? = null
+
+    /**
+     * 推送完 CGM 后保持连接的时长（ms）。超时即主动断开释放链路，
+     * 让 AAPS（闭环主控制方）在下个 5 分钟周期独占泵。AAPS 优先级高于伴生 App。
+     * 设 5s：足够覆盖写 CHAR_CGM 的 ACK/notify，又不长期霸占 ACL。
+     */
+    private val RELEASE_DELAY_MS = 5000L
 
     // ============================================================
     // 扫描
@@ -167,19 +183,21 @@ class PumpBleManager @Inject constructor(
 
     @SuppressLint("MissingPermission")
     private fun connect(device: BluetoothDevice) {
-        // 同手机上与 AAPS 共存：用 autoConnect=true 建立后台常驻连接，
-        // 不与 AAPS 的直连(connectGatt autoConnect=false)抢同一条 ACL——
-        // 两个 App 都直连会在连接建立/服务发现/绑定的瞬间互相竞态，间歇性互相挤掉。
+        // 必须 autoConnect=false（直连），与 AAPS 的 connectGatt 模式一致——
+        // Android 不允许第二个 direct 连接复用 autoConnect=true 建立的 ACL，
+        // 若此处用 autoConnect=true，AAPS 的直连会永远拿不到 CONNECTED 而超时。
+        // 伴生 App 不常驻：连接仅用于推送 CGM，推完由 releaseJob 主动释放（见 sendCgm）。
         if (_connectionState.value is ConnectionState.Connecting
             || _connectionState.value is ConnectionState.Connected) {
             return
         }
+        targetAddress = device.address
         _connectionState.value = ConnectionState.Connecting
         connectDeferred = CompletableDeferred()
         intentionalDisconnect = false
         try {
             gatt = device.connectGatt(
-                context, true, gattCallback, BluetoothDevice.TRANSPORT_LE
+                context, false, gattCallback, BluetoothDevice.TRANSPORT_LE
             )
         } catch (e: SecurityException) {
             _connectionState.value = ConnectionState.Error("连接被拒绝：${e.message}")
@@ -220,6 +238,7 @@ class PumpBleManager @Inject constructor(
     @SuppressLint("MissingPermission")
     fun disconnect() {
         intentionalDisconnect = true
+        cancelIdleRelease()
         runCatching {
             gatt?.disconnect()
             gatt?.close()
@@ -231,6 +250,24 @@ class PumpBleManager @Inject constructor(
         _pumpLiveState.value = null
         _iob.value = 0.0
         _reservoir.value = 0
+    }
+
+    /** 调度空闲释放：RELEASE_DELAY_MS 后若仍空闲则主动断开，把链路让给 AAPS。 */
+    private fun scheduleIdleRelease() {
+        cancelIdleRelease()
+        releaseJob = scope.launch {
+            delay(RELEASE_DELAY_MS)
+            if (_connectionState.value is ConnectionState.Connected) {
+                Log.i(TAG, "idle release (yield to AAPS) -> disconnect")
+                disconnect()
+            }
+        }
+    }
+
+    /** 取消空闲释放计时（连接活跃/有新推送/显式断开时调用）。 */
+    private fun cancelIdleRelease() {
+        releaseJob?.cancel()
+        releaseJob = null
     }
 
     private fun resetCharacteristics() {
@@ -255,29 +292,25 @@ class PumpBleManager @Inject constructor(
                 BluetoothProfile.STATE_CONNECTED -> {
                     connectDeferred?.complete(true)
                     connectDeferred = null
-                    Log.i(TAG, "onConnectionStateChange CONNECTED (intentionalDisconnect=$intentionalDisconnect)")
+                    targetAddress = g.device.address
+                    Log.i(TAG, "onConnectionStateChange CONNECTED")
                     // 连接成功后统一发现服务（onScanResult 路径此前不调 discoverServices 会卡 Connecting）
                     runCatching { g.discoverServices() }
+                    // 不常驻：连接空闲一段时间后由 releaseJob 主动释放，把链路让给 AAPS。
+                    scheduleIdleRelease()
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     connectDeferred?.complete(false)
                     connectDeferred = null
                     discoverDeferred?.complete(false)
                     discoverDeferred = null
+                    cancelIdleRelease()
                     Log.w(TAG, "onConnectionStateChange DISCONNECTED (intentionalDisconnect=$intentionalDisconnect, status=$status)")
-                    if (intentionalDisconnect) {
-                        runCatching { g.close() }
-                        gatt = null
-                        resetCharacteristics()
-                        _connectionState.value = ConnectionState.Disconnected
-                    } else {
-                        // 非主动断开：autoConnect=true 已让 Android 后台自动重连，
-                        // 切勿 close()（会取消 autoConnect），仅更新状态并把特征置空，
-                        // 保留 gatt 句柄供重连复用。这样即使 AAPS 周期断连把 ACL 瞬断，
-                        // 伴生 App 也不拆链，AAPS 下次直连可稳定复用同一 ACL。
-                        resetCharacteristics()
-                        _connectionState.value = ConnectionState.Disconnected
-                    }
+                    // 直连模式下，无论主动/被动断开都关闭本端 GATT（不影响 AAPS 仍持有的 ACL）。
+                    runCatching { g.close() }
+                    gatt = null
+                    resetCharacteristics()
+                    _connectionState.value = ConnectionState.Disconnected
                 }
             }
         }
@@ -454,13 +487,52 @@ class PumpBleManager @Inject constructor(
         writeWithAck(gatt ?: return@withContext fail("GATT 未就绪"), char, payload)
     }
 
-    /** 回传血糖 (mg/dl) 与趋势五档码(-2..2)，供泵显示。 */
+    /**
+     * 回传血糖 (mg/dl) 与趋势五档码(-2..2) 供泵显示。
+     *
+     * 链路空闲时按需连接（与 AAPS 共用同一条 ACL，直连模式一致，AAPS 优先级更高）；
+     * 推送成功后调度空闲释放，把链路让回 AAPS，避免伴生常驻饿死 AAPS 的直连。
+     */
     suspend fun sendCgm(mgdl: Int, trend: Int): Result<Unit> = withContext(Dispatchers.IO) {
-        val char = cgmChar ?: return@withContext fail("未连接或未发现 CGM 特征")
+        if (_connectionState.value !is ConnectionState.Connected || gatt == null) {
+            val addr = targetAddress
+            if (addr == null) {
+                Log.w(TAG, "sendCgm: 无配对地址，跳过")
+                return@withContext Result.failure(Exception("未配对，无法连接泵"))
+            }
+            Log.i(TAG, "sendCgm: 链路空闲，按需连接 $addr")
+            val ok = connect(addr)
+            if (!ok) {
+                Log.w(TAG, "sendCgm: 连接泵超时/失败")
+                return@withContext Result.failure(Exception("连接泵超时/失败"))
+            }
+        }
+        // 重连后 gatt 可能尚未 ready（CONNECTED 回调与栈实际可写状态存在竞态，
+        // 实测 CONNECTED 后 ~40ms 内 writeCharacteristic 立即返回 false），写失败退避重试。
         val payload = PumpProtocol.buildCgm(mgdl, trend)
         Log.i(TAG, "sendCgm mgdl=$mgdl trend=$trend -> CHAR_CGM")
-        val r = writeWithAck(gatt ?: return@withContext fail("GATT 未就绪"), char, payload)
-        Log.i(TAG, "sendCgm result=${if (r.isSuccess) "OK" else "FAIL:" + r.exceptionOrNull()?.message}")
+        var attempt = 0
+        var r: Result<Unit> = Result.failure(Exception("未初始化"))
+        do {
+            if (attempt > 0) {
+                Log.w(TAG, "sendCgm retry #$attempt (prev: ${r.exceptionOrNull()?.message})")
+                delay(500)
+                // 重试期间链路若被拆（或特征被清空），重新连接
+                if (_connectionState.value !is ConnectionState.Connected || gatt == null || cgmChar == null) {
+                    val addr = targetAddress ?: return@withContext Result.failure(Exception("未配对，无法连接泵"))
+                    if (!connect(addr)) return@withContext Result.failure(Exception("重连失败"))
+                }
+            }
+            val c = cgmChar ?: return@withContext Result.failure(Exception("未连接或未发现 CGM 特征"))
+            r = writeWithAck(gatt ?: return@withContext Result.failure(Exception("GATT 未就绪")), c, payload)
+            attempt++
+        } while (r.isFailure && attempt <= 3)
+        if (r.isSuccess) {
+            Log.i(TAG, "sendCgm result=OK (attempt $attempt)")
+            scheduleIdleRelease()   // 推完延迟释放，让路 AAPS
+        } else {
+            Log.w(TAG, "sendCgm result=FAIL after $attempt attempts: ${r.exceptionOrNull()?.message}")
+        }
         r
     }
 
