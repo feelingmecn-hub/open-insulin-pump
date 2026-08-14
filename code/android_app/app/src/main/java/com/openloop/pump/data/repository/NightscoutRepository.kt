@@ -103,14 +103,18 @@ class NightscoutRepository @Inject constructor(
         return runCatching { a.postEntries(body).requireSuccess() }
     }
 
-    /** 拉取最近一条血糖（无本地 CGM 时的备用）。 */
+    /**
+     * 拉取最近一条血糖（无本地 CGM / AAPS 广播收不到时的备用源）。
+     * 闭环中 AAPS 必把血糖上传 Nightscout，故伴生 App 可直接轮询 NS 取最新 SGV，
+     * 不受 xDrip 缺失 / AAPS 状态广播权限保护的限制。direction 解析为趋势箭头。
+     */
     suspend fun fetchLatestGlucose(): GlucoseReading? {
         val a = api() ?: return null
         return runCatching {
             a.getEntries(1).firstOrNull()?.let {
                 GlucoseReading(
                     mgdl = it.sgv,
-                    trend = GlucoseReading.Trend.UNKNOWN,
+                    trend = GlucoseReading.Trend.fromString(it.direction),
                     timestamp = it.date
                 )
             }

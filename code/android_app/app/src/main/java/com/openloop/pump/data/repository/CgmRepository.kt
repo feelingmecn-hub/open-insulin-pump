@@ -8,14 +8,21 @@ import android.content.IntentFilter
 import androidx.core.content.ContextCompat
 import com.openloop.pump.domain.model.GlucoseReading
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * CGM 数据源 —— 同时订阅两个本地广播，取任一最新读数：
+ * CGM 数据源 —— 三路取任一最新读数：
  *  1) xDrip+ 广播  Action: "com.eveningoutpost.dexdrip.BgEstimate"
  *     extras(真实命名空间 key，已用真机 dump 确认):
  *       com.eveningoutpost.dexdrip.Extras.BgEstimate (Double/Float, mg/dL)
@@ -24,17 +31,28 @@ import javax.inject.Singleton
  *     （同时兼容旧 key estimated_glucose_mgdl/trend/timestamp 兜底，防其它发送方）
  *  2) AAPS 状态广播 Action: "info.nightscout.androidaps.status"（Tizen/Smartwatch 同步插件发出）
  *     extras: glucoseMgdl(Double, 单位见 units) / units("mg/dl"|"mmol") / slopeArrow(String) / glucoseTimeStamp(Long ms)
- *     闭环中 AAPS 必然持有最新血糖，故以此作第二数据源，免去对 xDrip 的硬性依赖。
- * 两路均用 RECEIVER_EXPORTED 注册（第三方 App 广播，公开且无安全/计费影响）。
+ *     闭环中 AAPS 必然持有最新血糖，但其广播带权限保护，第三方 App（含本 App）常收不到。
+ *  3) Nightscout 轮询：闭环中 AAPS 必把血糖上传 NS，本 App 定时拉取最近 SGV，
+ *     作为无 xDrip / AAPS 广播收不到时的稳定备用源（权限自由、HTTP 可达）。
+ * 两路广播用 RECEIVER_EXPORTED 注册（第三方 App 广播，公开且无安全/计费影响）。
  */
 @Singleton
 class CgmRepository @Inject constructor(
-    @ApplicationContext private val context: Context
+    @ApplicationContext private val context: Context,
+    private val nsRepo: NightscoutRepository
 ) {
     private val _glucose = MutableStateFlow<GlucoseReading?>(null)
     val glucose: StateFlow<GlucoseReading?> = _glucose.asStateFlow()
 
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /** Nightscout 轮询间隔：CGM 约 5min 一跳，60s 轮询可在新值到达后 ~1min 内推给泵。 */
+    private val NS_POLL_MS = 60_000L
+
     private var receiver: BroadcastReceiver? = null
+
+    /** Nightscout 轮询 Job（register 启动 / unregister 取消）。 */
+    private var nsPollJob: Job? = null
 
     /** AAPS 状态广播（Tizen/Smartwatch 同步插件发出）：含 glucoseMgdl / slopeArrow / glucoseTimeStamp。 */
     private val AAPS_STATUS_ACTION = "info.nightscout.androidaps.status"
@@ -61,6 +79,29 @@ class CgmRepository @Inject constructor(
         ContextCompat.registerReceiver(
             context, receiver, filter, ContextCompat.RECEIVER_EXPORTED
         )
+        startNsPolling()
+    }
+
+    /** 启动 Nightscout 轮询：定时拉取最近 SGV，作为广播收不到时的备用 CGM 源。 */
+    private fun startNsPolling() {
+        if (nsPollJob?.isActive == true) return
+        nsPollJob = scope.launch {
+            while (isActive) {
+                delay(NS_POLL_MS)
+                runCatching { nsRepo.fetchLatestGlucose() }
+                    .getOrNull()
+                    ?.let { g ->
+                        val cur = _glucose.value
+                        // 仅当 NS 读数更新（时间戳更新）才刷新，避免重复推送同一帧
+                        if (cur == null || g.timestamp > cur.timestamp) {
+                            Log.i("CgmRepository", "NS poll -> mgdl=${g.mgdl} trend=${g.trend} ts=${g.timestamp}")
+                            _glucose.value = g
+                        } else {
+                            Log.d("CgmRepository", "NS poll: 无更新 (ns ts=${g.timestamp} <= cur ${cur?.timestamp})")
+                        }
+                    }
+            }
+        }
     }
 
     /**
@@ -117,5 +158,7 @@ class CgmRepository @Inject constructor(
     fun unregister() {
         runCatching { context.unregisterReceiver(receiver) }
         receiver = null
+        nsPollJob?.cancel()
+        nsPollJob = null
     }
 }
