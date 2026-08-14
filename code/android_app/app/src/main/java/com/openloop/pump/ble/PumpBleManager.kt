@@ -239,11 +239,20 @@ class PumpBleManager @Inject constructor(
     fun disconnect() {
         intentionalDisconnect = true
         cancelIdleRelease()
-        runCatching {
-            gatt?.disconnect()
-            gatt?.close()
-        }
+        val g = gatt
         gatt = null
+        if (g != null) {
+            // 只发起断开；真正的 g.close() 交给 onConnectionStateChange 的 DISCONNECTED 回调执行。
+            // 切勿 disconnect() + close() 同步连调——EMUI 上该竞态会把底层 ACL 拆坏，
+            // 残留"僵尸链路"常驻（实测 08-13 17:33 起的僵尸 ACL 饿死 AAPS 加密握手近 15h，
+            // 且杀进程都清不掉，只能重置手机蓝牙）。
+            runCatching { g.disconnect() }
+            // 兜底：1s 内若 DISCONNECTED 回调未触发 close，则强制 close，杜绝僵尸 ACL。
+            scope.launch {
+                delay(1000)
+                runCatching { g.close() }
+            }
+        }
         resetCharacteristics()
         _connectionState.value = ConnectionState.Disconnected
         _pumpStatus.value = null
@@ -257,7 +266,9 @@ class PumpBleManager @Inject constructor(
         cancelIdleRelease()
         releaseJob = scope.launch {
             delay(RELEASE_DELAY_MS)
-            if (_connectionState.value is ConnectionState.Connected) {
+            // 无条件释放：只要本端仍持有 gatt 就断开。若仅靠 `state is Connected` 判断，
+            // 服务发现失败等情况下 state 非 Connected 会漏掉释放，把 ACL 永久占住而饿死 AAPS。
+            if (gatt != null) {
                 Log.i(TAG, "idle release (yield to AAPS) -> disconnect")
                 disconnect()
             }
