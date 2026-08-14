@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.work.WorkManager
@@ -50,12 +51,17 @@ class PumpConnectionService : Service() {
             val addr = prefs.pairedAddress.first()
             if (addr != null) pumpRepo.connect(addr) else pumpRepo.startScan()
         }
-        // 收到 xDrip 血糖即回传泵（AAPS 不下发血糖，此路为泵获取 CGM 的唯一来源）；
-        // sendCgm 内部按需连接（链路空闲时连、推完释放让路 AAPS），无需先判 Connected。
+        // 收到血糖(xDrip 或 AAPS 状态广播)即回传泵；sendCgm 内部按需连接
+        // （链路空闲时连、推完释放让路 AAPS），无需先判 Connected。
         scope.launch {
             cgmRepo.glucose.collect { reading ->
                 reading ?: return@collect
-                runCatching { pumpRepo.sendCgm(reading.mgdl, reading.trend.toCgmCode()) }
+                Log.i("PumpConn", "glucose emit -> sendCgm mgdl=${reading.mgdl} trend=${reading.trend}")
+                try {
+                    pumpRepo.sendCgm(reading.mgdl, reading.trend.toCgmCode())
+                } catch (e: Exception) {
+                    Log.w("PumpConn", "sendCgm threw: ${e.message}")
+                }
             }
         }
         // 连接建立后立刻补推一次当前读数，避免等到下一跳(≤5min)。
@@ -63,7 +69,12 @@ class PumpConnectionService : Service() {
             pumpRepo.connectionState.collect { state ->
                 if (state is ConnectionState.Connected) {
                     cgmRepo.glucose.value?.let { r ->
-                        runCatching { pumpRepo.sendCgm(r.mgdl, r.trend.toCgmCode()) }
+                        Log.i("PumpConn", "connected ->补推 sendCgm mgdl=${r.mgdl}")
+                        try {
+                            pumpRepo.sendCgm(r.mgdl, r.trend.toCgmCode())
+                        } catch (e: Exception) {
+                            Log.w("PumpConn", "补推 sendCgm threw: ${e.message}")
+                        }
                     }
                 }
             }

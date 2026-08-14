@@ -25,9 +25,9 @@ data class GlucoseReading(
         companion object {
             fun fromString(s: String?): Trend = when (s?.uppercase()) {
                 "RISING_FAST", "DoubleUp" -> RISING_FAST
-                "RISING", "SingleUp" -> RISING
+                "RISING", "SingleUp", "FortyFiveUp" -> RISING
                 "FLAT", "Flat" -> FLAT
-                "FALLING", "SingleDown" -> FALLING
+                "FALLING", "SingleDown", "FortyFiveDown" -> FALLING
                 "FALLING_FAST", "DoubleDown" -> FALLING_FAST
                 else -> UNKNOWN
             }
