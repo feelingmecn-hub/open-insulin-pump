@@ -4,6 +4,29 @@
 
 ---
 
+## 2026-08-14 — v10.1 固件+App 发布（GitHub Release v10.1）
+
+> 理论验证 / 教学原型，严禁用于人体。本版聚焦「AAPS 上次连接 NNN 分前」根因修复，并归集自 v10 以来的多项记账 / 时区修复。
+
+### ① 固件（ESP32-C6）自 v10 累计修复
+- TBR 临时基础率设置失败修复 + 泵菜单 TBR 进 AAPS 账本（2026-08-12）
+- AAPS 历史事件(0xC2)回放修复 → 治疗页全量记账（大剂量 / TBR / 方波）
+- 大剂量「已输注」记账修复（0U 丢包 + 9.92U 漂移）
+- Dana 协议时区修正（泵屏本地时间，AAPS 不再报大时间差）
+
+### ② 伴生 App（com.openloop.pump）自 v10 累计修复
+- xDrip 血糖 → 泵 CGM 回传管道
+- 双 App 共存稳定 + CGM 接收器修复 + 打开即连泵
+- 修复 AAPS 连不上 + CGM 推送可靠性（autoConnect=false 直连 + 空闲让路）
+- 🔴 **根治僵尸 ACL 饿死 AAPS 加密握手**（commit `b457a11`）：`disconnect()` 不再同步连调 `close()`（华为 EMUI 上该竞态把底层 BLE ACL 拆坏残留僵尸链路，AAPS 加密握手永远超时、上次连接卡死）；`scheduleIdleRelease()` 改为无条件释放。
+
+### ③ 发布资产（Release v10.1）
+- 固件正式版 + debug 版（含 `MOTOR_DEBUG_UNLOCKED`），各含 app / bootloader / partitions / merged_ALL bin + 对应 flash 脚本
+- 伴生 App：`companion-app-debug.apk`
+- 详见 Release Notes 与 `v10.1-README.md`
+
+---
+
 ## 2026-08-12 — TBR 临时基础率设置失败修复 + 泵菜单 TBR 进 AAPS 账本
 
 > 用户实测闭环：AAPS 设 TBR 报 `Temp basal set :成功:false 评论:临时基础输注错误`，治疗页也看不到泵本地菜单设的 TBR。两处根因不同，均已修复。
