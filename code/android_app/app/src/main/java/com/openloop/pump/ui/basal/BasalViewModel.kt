@@ -48,22 +48,42 @@ class BasalViewModel @Inject constructor(
             saving.value = true
             saveResult.value = null
             try {
+                // 1) 批量写前先确保链路已连，避免 24 段静默全失败（GATT 未就绪）
+                if (!pumpRepo.ensureConnected()) {
+                    saveResult.value = "未连接泵：请先在首页连接泵，再点「应用全部到泵」。"
+                    return@launch
+                }
+                // 2) 读取激活方案索引（写 24 段的目标档案）
                 val profRes = pumpRepo.getActiveBasalProfile()
                 val profile = if (profRes.isSuccess) profRes.getOrDefault(0) else 0
                 if (profRes.isFailure) {
                     Log.w(TAG, "读取激活方案失败，退回方案#0: ${profRes.exceptionOrNull()?.message}")
                 }
+                // 3) 逐槽写入（0x17 只改内存不落盘）；单槽失败重试 2 次，重试前若链路断了先重连
                 var ok = 0
+                val fails = mutableListOf<Int>()
                 slots.value.forEach { slot ->
-                    val r = pumpRepo.setBasalProfileSlot(profile, slot.hour, slot.rateUh)
-                    if (r.isSuccess) ok++ else Log.w(TAG, "写槽 hour=${slot.hour} 失败: ${r.exceptionOrNull()?.message}")
-                    delay(60) // 让步，避免刷爆 GATT 队列 / 与 CGM 推送冲突
+                    var done = false
+                    repeat(3) { attempt ->
+                        val r = pumpRepo.setBasalProfileSlot(profile, slot.hour, slot.rateUh)
+                        if (r.isSuccess) { ok++; done = true; return@repeat }
+                        Log.w(TAG, "写槽 hour=${slot.hour} 失败(尝试 $attempt): ${r.exceptionOrNull()?.message}")
+                        if (!pumpRepo.ensureConnected()) { delay(300); return@repeat }
+                        delay(200)
+                    }
+                    if (!done) fails.add(slot.hour)
+                    delay(50) // 让步，避免刷爆 GATT 队列 / 与 CGM 推送冲突
                 }
+                // 4) 写完后一次性提交落盘（0x19），NVS 只写一次，彻底消除连续写压力
+                val commit = pumpRepo.commitConfig()
                 val total = slots.value.size
-                saveResult.value = if (ok == total)
-                    "已写入泵内档案(激活方案 #$profile)全部 $total 段。点「验证测试」核对电机会不会动。"
-                else
-                    "部分写入失败：$ok/$total 段成功（其余失败，见日志）。"
+                saveResult.value = buildString {
+                    if (ok == total) append("已写入泵内档案(方案 #$profile)全部 $total 段。")
+                    else append("部分写入失败：$ok/$total 段成功（失败槽位: ${fails.joinToString()}）。")
+                    if (commit.isSuccess) append("已提交保存。")
+                    else append("⚠️本地已写入但落盘失败(${commit.exceptionOrNull()?.message})，重启泵会丢失，请重试提交。")
+                    if (ok == total) append("点「验证测试」核对电机会不会动。")
+                }
             } catch (e: Exception) {
                 saveResult.value = "写入异常：${e.message ?: "未知错误"}"
             } finally {

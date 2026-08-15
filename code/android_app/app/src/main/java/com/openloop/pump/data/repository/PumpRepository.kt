@@ -73,4 +73,10 @@ class PumpRepository @Inject constructor(
      */
     suspend fun runBasalTest() =
         ble.sendControl(com.openloop.pump.ble.PumpProtocolSpec.CTRL_CMD_BASAL_TEST)
+
+    /** 批量写前确保 BLE 已连；未连按配对地址重连。返回是否就绪。 */
+    suspend fun ensureConnected(): Boolean = ble.ensureConnected()
+
+    /** 写完 24 段后一次性提交配置到 NVS（SET 0x19）。 */
+    suspend fun commitConfig(): Result<Unit> = ble.setCommitConfig()
 }

@@ -386,6 +386,8 @@ class ChCb : public NimBLECharacteristicCallbacks {
                     break;
                 }
                 case 0x17: { // SET_PROFILE_SLOT → profile_idx u8, hour u8, f32 rate
+                    // 只改内存、不落盘：24 段连续写若每段都 storage_save_config 会累积 NVS 脏数据，
+                    // 后段触发 GC 爆发导致 BLE 写/读超时被 App 判失败甚至断连。统一由 0x19 一次性提交。
                     if (plen != 7) { resp.push_back(1); break; }
                     uint8_t pi = (uint8_t)v[1]; uint8_t hh = (uint8_t)v[2];
                     if (pi >= MAX_BASAL_PROFILES || hh >= BASAL_SLOTS_PER_DAY) { resp.push_back(1); break; }
@@ -393,6 +395,10 @@ class ChCb : public NimBLECharacteristicCallbacks {
                     if (r < 0.0f) r = 0.0f;
                     if (r > MAX_BASAL_RATE) r = MAX_BASAL_RATE;
                     g_pump_config.profiles[pi].slots[hh].rate_uh = r;
+                    resp.push_back(0);
+                    break;
+                }
+                case 0x19: { // COMMIT_CONFIG → 将内存中的 pump_config 一次性落盘 NVS
                     storage_save_config(&g_pump_config);
                     resp.push_back(0);
                     break;

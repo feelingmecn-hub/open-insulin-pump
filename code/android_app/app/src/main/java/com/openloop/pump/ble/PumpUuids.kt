@@ -97,6 +97,7 @@ object PumpProtocolSpec {
     const val SET_OP_SET_PROFILE_NAME  = 0x15  // payload: profile u8 + name
     const val SET_OP_GET_PROFILE_SLOT  = 0x16  // payload: profile u8, hour u8 → f32
     const val SET_OP_SET_PROFILE_SLOT  = 0x17  // payload: profile u8, hour u8, f32
+    const val SET_OP_COMMIT_CONFIG     = 0x19  // 将内存配置一次性落盘 NVS（写 24 段后调一次）
     const val SET_OP_GET_LIMITS        = 0x20  // → 3×f32
     const val SET_OP_SET_LIMIT         = 0x21  // payload: which u8, f32
     const val SET_OP_GET_SAFETY        = 0x22  // → occlusion u16, watchdog u8, over_temp f32

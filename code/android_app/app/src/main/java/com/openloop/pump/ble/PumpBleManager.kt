@@ -516,6 +516,34 @@ class PumpBleManager @Inject constructor(
      * 链路空闲时按需连接（与 AAPS 共用同一条 ACL，直连模式一致，AAPS 优先级更高）；
      * 推送成功后调度空闲释放，把链路让回 AAPS，避免伴生常驻饿死 AAPS 的直连。
      */
+    /**
+     * 确保 BLE 链路已连且可写；未连则按配对地址重连（带重试）。
+     * 供「应用全部到泵」等批量写操作在开始前对连接做自检，避免出现
+     * 24 段静默全失败（GATT 未就绪）才让用户发现没连上。
+     * 返回是否就绪。
+     */
+    suspend fun ensureConnected(): Boolean {
+        if (_connectionState.value is ConnectionState.Connected && gatt != null) return true
+        val addr = targetAddress ?: run {
+            Log.w(TAG, "ensureConnected: 无配对地址")
+            return false
+        }
+        Log.i(TAG, "ensureConnected: 链路空闲，按需连接 $addr")
+        repeat(2) { i ->
+            if (connect(addr)) return true
+            Log.w(TAG, "ensureConnected: 连接失败 #$i，重试")
+            delay(500)
+        }
+        return false
+    }
+
+    /** 提交内存配置到 NVS（SET 0x19）：写完 24 段后调用一次，避免每段都落盘引发 NVS 压力。 */
+    suspend fun setCommitConfig(): Result<Unit> = withContext(Dispatchers.IO) {
+        val r = requestSettings(PumpProtocolSpec.SET_OP_COMMIT_CONFIG, byteArrayOf())
+        if (r.isSuccess) Result.success(Unit)
+        else Result.failure(r.exceptionOrNull() ?: IllegalStateException("提交配置到 NVS 失败"))
+    }
+
     suspend fun sendCgm(mgdl: Int, trend: Int): Result<Unit> = withContext(Dispatchers.IO) {
         if (_connectionState.value !is ConnectionState.Connected || gatt == null) {
             val addr = targetAddress
