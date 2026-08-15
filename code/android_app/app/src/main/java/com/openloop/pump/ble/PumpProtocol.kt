@@ -149,6 +149,17 @@ object PumpProtocol {
                 or ((b[off + 3].toInt() and 0xFF) shl 24)
         )
 
+    /** 小端写 f32（4 字节 LE），用于 SET 0x17 等带浮点 payload 的命令。 */
+    fun f32Le(v: Float): ByteArray {
+        val bits = v.toBits()
+        return byteArrayOf(
+            (bits and 0xFF).toByte(),
+            ((bits shr 8) and 0xFF).toByte(),
+            ((bits shr 16) and 0xFF).toByte(),
+            ((bits shr 24) and 0xFF).toByte()
+        )
+    }
+
     /** 小端读 u16。 */
     fun leU16(b: ByteArray, off: Int): Int =
         (b[off].toInt() and 0xFF) or ((b[off + 1].toInt() and 0xFF) shl 8)

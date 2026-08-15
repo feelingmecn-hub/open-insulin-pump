@@ -36,6 +36,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.coroutines.resume
@@ -107,6 +109,16 @@ class PumpBleManager @Inject constructor(
     private var writeDeferred: CompletableDeferred<Boolean>? = null
     private var readDeferred: CompletableDeferred<ByteArray?>? = null
     private val bondListeners = mutableListOf<(Boolean) -> Unit>()
+
+    /**
+     * GATT 请求串行化锁。所有写/读特征操作必须串行（蓝牙单连接本就串行），
+     * 否则并发写（如 CGM 推送与「应用全部到泵」连续 24 次写入）会互相覆盖
+     * writeDeferred/readDeferred，导致某次 await 永不完成、调用方永久挂起。
+     */
+    private val gattMutex = Mutex()
+
+    /** 单次 GATT 写/读等待上限：超出即判失败，杜绝永久挂起（按钮卡「写入中」的根因）。 */
+    private val GATT_IO_TIMEOUT_MS = 8000L
 
     /**
      * 是否为主动断开。true=用户/服务显式断开（需 close 释放 GATT）；
@@ -563,33 +575,60 @@ class PumpBleManager @Inject constructor(
     }
 
     /**
-     * 设置通道请求：写 [op][payload][crc] 后读取响应。
+     * 设置通道请求：写 [op][payload][crc] 后读取响应，整体在 [gattMutex] 内串行。
      * GET 类 op 返回结果字节；SET 类 op 返回 1 字节 ack (0=OK / 1=ERR)。
      */
     suspend fun requestSettings(op: Int, payload: ByteArray = byteArrayOf()): Result<ByteArray> =
         withContext(Dispatchers.IO) {
-            val g = gatt ?: return@withContext fail("GATT 未就绪")
-            val char = settingsChar ?: return@withContext fail("未连接或未发现 Settings 特征")
-            val req = PumpProtocol.buildSettings(op, payload)
-            val w = writeWithAck(g, char, req)
-            if (w.isFailure) return@withContext Result.failure(w.exceptionOrNull()!!)
-            readDeferred = CompletableDeferred()
-            val started = runCatching {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    g.readCharacteristic(char)
-                    true
-                } else {
-                    @Suppress("DEPRECATION")
-                    g.readCharacteristic(char)
+            gattMutex.withLock {
+                val g = gatt ?: return@withLock fail("GATT 未就绪")
+                val char = settingsChar ?: return@withLock fail("未连接或未发现 Settings 特征")
+                val req = PumpProtocol.buildSettings(op, payload)
+                if (!rawWrite(g, char, req)) return@withLock Result.failure(IOException2("设置写入未确认(超时)"))
+                readDeferred = CompletableDeferred()
+                val started = runCatching {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        g.readCharacteristic(char)
+                        true
+                    } else {
+                        @Suppress("DEPRECATION")
+                        g.readCharacteristic(char)
+                    }
+                }.getOrDefault(false)
+                if (!started) {
+                    readDeferred = null
+                    return@withLock fail("发起设置读取失败")
                 }
-            }.getOrDefault(false)
-            if (!started) {
+                val data = withTimeoutOrNull(GATT_IO_TIMEOUT_MS) { readDeferred!!.await() }
                 readDeferred = null
-                return@withContext fail("发起设置读取失败")
+                if (data != null) Result.success(data) else Result.failure(IllegalStateException("设置读取无响应(超时)"))
             }
-            val data = readDeferred?.await()
-            readDeferred = null
-            if (data != null) Result.success(data) else Result.failure(IllegalStateException("设置读取无响应"))
+        }
+
+    /** 读取当前激活基础率方案索引（SET 0x10 → profile u8）。 */
+    suspend fun getActiveBasalProfile(): Result<Int> = withContext(Dispatchers.IO) {
+        val r = requestSettings(PumpProtocolSpec.SET_OP_GET_ACTIVE_PROFILE, byteArrayOf())
+        if (r.isFailure) return@withContext Result.failure(r.exceptionOrNull()!!)
+        val b = r.getOrNull() ?: return@withContext Result.failure(IllegalStateException("空响应"))
+        Result.success((b.firstOrNull()?.toInt() ?: 0) and 0xFF)
+    }
+
+    /**
+     * 写入基础率方案单槽（SET 0x17）：payload = [profile u8][hour u8][rate f32 LE]。
+     * 真正持久化到泵内 NVS 档案（区别于 setBasalRate 只设实时运行速率），
+     * 这样「应用全部到泵」才能把 24 段方案写进泵，runBasalTest 才能核对。
+     */
+    suspend fun setBasalProfileSlot(profile: Int, hour: Int, rateUh: Double): Result<Unit> =
+        withContext(Dispatchers.IO) {
+            val payload = byteArrayOf(
+                (profile and 0xFF).toByte(),
+                (hour and 0xFF).toByte()
+            ) + PumpProtocol.f32Le(rateUh.toFloat())
+            val r = requestSettings(PumpProtocolSpec.SET_OP_SET_PROFILE_SLOT, payload)
+            if (r.isFailure) return@withContext Result.failure(r.exceptionOrNull()!!)
+            val ack = r.getOrNull()?.firstOrNull() ?: 0x01.toByte()
+            if (ack == 0x00.toByte()) Result.success(Unit)
+            else Result.failure(IllegalStateException("泵拒绝写槽(profile=$profile,hour=$hour)"))
         }
 
     /** 远程按键按下（event 见 PumpProtocolSpec.KEY_*）。等同物理按键，泵屏同步。 */
@@ -626,18 +665,30 @@ class PumpBleManager @Inject constructor(
     // 底层读写（兼容新旧 API）
     // ============================================================
 
-    private suspend fun writeWithAck(
+    /**
+     * 底层单次写（不持锁）：置 deferred → 发起写 → 带超时等待 onCharacteristicWrite 完成。
+     * 调用方负责用 [gattMutex] 串行化，避免并发写覆盖 deferred。
+     */
+    private suspend fun rawWrite(
         g: BluetoothGatt, char: BluetoothGattCharacteristic, value: ByteArray
-    ): Result<Unit> {
+    ): Boolean {
         writeDeferred = CompletableDeferred()
         val started = writeCharacteristic(g, char, value)
         if (!started) {
             writeDeferred = null
-            return Result.failure(IllegalStateException("发起写入失败"))
+            return false
         }
-        val ok = try { writeDeferred!!.await() } catch (_: Exception) { false }
+        val ok = withTimeoutOrNull(GATT_IO_TIMEOUT_MS) { writeDeferred!!.await() } ?: false
         writeDeferred = null
-        return if (ok) Result.success(Unit) else Result.failure(IOException2("写入未确认"))
+        return ok
+    }
+
+    /** 串行化写（with-response）：返回结果。带超时，永不永久挂起。 */
+    private suspend fun writeWithAck(
+        g: BluetoothGatt, char: BluetoothGattCharacteristic, value: ByteArray
+    ): Result<Unit> = gattMutex.withLock {
+        if (rawWrite(g, char, value)) Result.success(Unit)
+        else Result.failure(IOException2("写入未确认(超时)"))
     }
 
     @SuppressLint("MissingPermission", "DeprecatedBlockingMethod")

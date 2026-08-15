@@ -36,6 +36,7 @@ fun BasalScreen(viewModel: BasalViewModel = hiltViewModel()) {
     val daily by viewModel.dailyTotal.collectAsStateWithLifecycle()
     val saving by viewModel.saving.collectAsStateWithLifecycle()
     val testResult by viewModel.testResult.collectAsStateWithLifecycle()
+    val saveResult by viewModel.saveResult.collectAsStateWithLifecycle()
     var showTestConfirm by remember { mutableStateOf(false) }
 
     androidx.compose.foundation.layout.Column(
@@ -82,6 +83,10 @@ fun BasalScreen(viewModel: BasalViewModel = hiltViewModel()) {
             modifier = Modifier.fillMaxWidth()
         ) {
             Text(if (saving) "写入泵中…" else "应用全部到泵")
+        }
+
+        saveResult?.let { msg ->
+            Text(msg, style = MaterialTheme.typography.bodyMedium)
         }
 
         Spacer(modifier = Modifier.height(8.dp))

@@ -42,6 +42,16 @@ class PumpRepository @Inject constructor(
     suspend fun updateBasalSlot(slot: Int, rateUh: Double) =
         ble.setBasalSlot(slot, rateUh)
 
+    /** 读取当前激活基础率方案索引。 */
+    suspend fun getActiveBasalProfile(): Result<Int> = ble.getActiveBasalProfile()
+
+    /**
+     * 写入基础率方案单槽到泵内 NVS 档案（SET 0x17）。
+     * 与 updateBasalSlot(只设实时速率) 不同，这是持久化 24 段方案的正确途径。
+     */
+    suspend fun setBasalProfileSlot(profile: Int, hour: Int, rateUh: Double): Result<Unit> =
+        ble.setBasalProfileSlot(profile, hour, rateUh)
+
     suspend fun setTemporaryBasal(rateUh: Double, durationMin: Int) =
         ble.setTemporaryBasal(rateUh, durationMin)
 
