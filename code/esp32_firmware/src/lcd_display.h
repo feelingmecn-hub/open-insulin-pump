@@ -30,3 +30,7 @@ void lcd_display_backlight(uint8_t percent);
 
 // 在 FreeRTOS display_task 中周期调用: 刷新 LVGL + 更新状态屏
 void lcd_display_task(void);
+
+// 开机画面 (独立 splash, 不进 ui_screen 状态机, 不影响联调模拟器单一真源):
+// 显示项目名/版本/自检项, 停留 hold_ms 后销毁并交回 ui_screen_init() 建主界面。
+void lcd_display_boot_screen(int hold_ms);
