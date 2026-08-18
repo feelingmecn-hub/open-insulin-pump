@@ -28,6 +28,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import android.widget.Toast
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -52,6 +54,7 @@ fun SettingsScreen(
     val appPasskey by viewModel.appBlePasskey.collectAsStateWithLifecycle()
 
     val conn by viewModel.connectionState.collectAsStateWithLifecycle()
+    val lastActionError by viewModel.lastActionError.collectAsStateWithLifecycle()
     val brightness by viewModel.brightness.collectAsStateWithLifecycle()
     val activeProfile by viewModel.activeProfile.collectAsStateWithLifecycle()
     val keypadSound by viewModel.keypadSound.collectAsStateWithLifecycle()
@@ -72,6 +75,14 @@ fun SettingsScreen(
 
     LaunchedEffect(conn) {
         if (connected) viewModel.loadPumpConfig()
+    }
+
+    // 下发操作的错误反馈（如未连接/写超时），避免「点了开关泵没反应」的静默失败。
+    val context = LocalContext.current
+    LaunchedEffect(lastActionError) {
+        lastActionError?.let {
+            Toast.makeText(context, it, Toast.LENGTH_LONG).show()
+        }
     }
 
     var urlDraft by remember { mutableStateOf(nsUrl ?: "") }

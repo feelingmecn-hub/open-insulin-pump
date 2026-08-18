@@ -3,6 +3,7 @@ package com.openloop.pump.ui.settings
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.openloop.pump.data.repository.PreferencesRepository
+import com.openloop.pump.data.repository.PumpRepository
 import com.openloop.pump.ble.ConnectionState
 import com.openloop.pump.ble.PumpBleManager
 import com.openloop.pump.ble.PumpProtocol
@@ -35,8 +36,19 @@ data class ProfileData(val name: String, val rates: FloatArray) {
 @HiltViewModel
 class SettingsViewModel @Inject constructor(
     private val prefs: PreferencesRepository,
+    private val repo: PumpRepository,
     private val ble: PumpBleManager
 ) : ViewModel() {
+
+    /** 进入设置页时抑制空闲释放并补连，保证控制命令可达；离开时恢复让路 AAPS。 */
+    init {
+        viewModelScope.launch { repo.holdConnection() }
+    }
+
+    override fun onCleared() {
+        repo.releaseConnection()
+        super.onCleared()
+    }
 
     // ----------------------------------------------------------
     // App 本地闭环偏好（仅 App 自身编排用，不直接下发泵）
@@ -68,6 +80,10 @@ class SettingsViewModel @Inject constructor(
     // 泵连接状态
     // ----------------------------------------------------------
     val connectionState: StateFlow<ConnectionState> = ble.connectionState
+
+    /** 最近一次下发操作的错误（UI 可用于 toast 提示），成功下发后清空前一次错误。 */
+    private val _lastActionError = MutableStateFlow<String?>(null)
+    val lastActionError: StateFlow<String?> = _lastActionError.asStateFlow()
 
     // ----------------------------------------------------------
     // 泵系统设置（SETTINGS 通道直读直写，不模拟按键）
@@ -201,7 +217,18 @@ class SettingsViewModel @Inject constructor(
     fun setLoopMode(m: Int) {
         val v = m.coerceIn(0, 2)
         _loopMode.value = v
-        io { ble.sendControl(v) }
+        io {
+            // 先确保链路已连（设置页虽已 holdConnection，但首次进入前可能尚未补连完成，
+            // 或链路被 AAPS 周期抢占）。未连则按需重连，直接下发到断链会静默失败且泵无反应。
+            if (!repo.ensureConnected()) {
+                _lastActionError.value = "设置环模式失败：泵未连接"
+                return@io
+            }
+            val r = ble.sendControl(v)
+            if (r.isFailure) {
+                _lastActionError.value = "设置环模式失败：${r.exceptionOrNull()?.message ?: "未知错误"}"
+            }
+        }
     }
 
     fun setLimit(which: Int, value: Float) {
@@ -323,24 +350,43 @@ class SettingsViewModel @Inject constructor(
     // ----------------------------------------------------------
     // 泵维护操作（直接发 CONTROL 指令调 ui_hal_*，不模拟按键）
     // ----------------------------------------------------------
-    fun primePump(ml: Float = 1.0f) {
-        io { ble.sendControl(PumpProtocolSpec.CTRL_CMD_PRIME, ml.coerceIn(0.1f, 200.0f)) }
+    fun primePump(ml: Float = 1.0f) = sendControlWithCheck("排气装药") {
+        ble.sendControl(PumpProtocolSpec.CTRL_CMD_PRIME, ml.coerceIn(0.1f, 200.0f))
     }
 
-    fun rewindPump() {
-        io { ble.sendControl(PumpProtocolSpec.CTRL_CMD_REWIND) }
+    fun rewindPump() = sendControlWithCheck("退回装药") {
+        ble.sendControl(PumpProtocolSpec.CTRL_CMD_REWIND)
     }
 
-    fun clearAlarm() {
-        io { ble.sendControl(PumpProtocolSpec.CTRL_CMD_CLEAR_ALARM) }
+    fun clearAlarm() = sendControlWithCheck("清除报警") {
+        ble.sendControl(PumpProtocolSpec.CTRL_CMD_CLEAR_ALARM)
     }
 
-    fun calibrateDispense(units: Float = 1.0f) {
-        io { ble.sendControl(PumpProtocolSpec.CTRL_CMD_CAL_DISPENSE, units.coerceIn(0.1f, 100.0f)) }
+    fun calibrateDispense(units: Float = 1.0f) = sendControlWithCheck("推出标定测试量") {
+        ble.sendControl(PumpProtocolSpec.CTRL_CMD_CAL_DISPENSE, units.coerceIn(0.1f, 100.0f))
     }
 
-    fun applyCalibration(factor: Float) {
-        io { ble.sendControl(PumpProtocolSpec.CTRL_CMD_CAL_APPLY, factor.coerceAtLeast(0.1f)) }
+    fun applyCalibration(factor: Float) = sendControlWithCheck("应用标定系数") {
+        ble.sendControl(PumpProtocolSpec.CTRL_CMD_CAL_APPLY, factor.coerceAtLeast(0.1f))
+    }
+
+    /**
+     * 统一封装维护类 CONTROL 指令：先确保链路已连，再下发；失败把原因写入
+     * [_lastActionError] 供 UI 提示，避免出现「点了开关泵没反应又不知为何」的静默失败。
+     */
+    private fun sendControlWithCheck(label: String, block: suspend () -> Result<Unit>) {
+        io {
+            if (!repo.ensureConnected()) {
+                _lastActionError.value = "${label}失败：泵未连接"
+                return@io
+            }
+            val r = block()
+            if (r.isFailure) {
+                _lastActionError.value = "${label}失败：${r.exceptionOrNull()?.message ?: "未知错误"}"
+            } else {
+                _lastActionError.value = null
+            }
+        }
     }
 
     // ----------------------------------------------------------
