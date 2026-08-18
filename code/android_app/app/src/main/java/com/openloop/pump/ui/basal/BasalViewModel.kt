@@ -47,6 +47,7 @@ class BasalViewModel @Inject constructor(
         viewModelScope.launch {
             saving.value = true
             saveResult.value = null
+            Log.d(TAG, ">>> applyAllToPump START savingBefore=${saving.value} totalSlots=${slots.value.size}")
             try {
                 // 1) 批量写前先确保链路已连，避免 24 段静默全失败（GATT 未就绪）
                 if (!pumpRepo.ensureConnected()) {
@@ -59,24 +60,28 @@ class BasalViewModel @Inject constructor(
                 if (profRes.isFailure) {
                     Log.w(TAG, "读取激活方案失败，退回方案#0: ${profRes.exceptionOrNull()?.message}")
                 }
-                // 3) 逐槽写入（0x17 只改内存不落盘）；单槽失败重试 2 次，重试前若链路断了先重连
+                // 3) 逐槽写入（0x17 只改内存不落盘）；每槽写前确保链路，瞬时断连自动重连后重试，
+                //    不再「连不上就放弃该槽」。最多 5 次尝试覆盖 1~2s 的瞬时断连。
                 var ok = 0
                 val fails = mutableListOf<Int>()
-                slots.value.forEach { slot ->
-                    var done = false
-                    repeat(3) { attempt ->
+                for (slot in slots.value) {
+                    var written = false
+                    for (attempt in 0 until 5) {
+                        // 写前先确保链路（瞬时断连会自动重连），连不上就等一会再试该槽，不放弃
+                        if (!pumpRepo.ensureConnected()) { delay(600); continue }
                         val r = pumpRepo.setBasalProfileSlot(profile, slot.hour, slot.rateUh)
-                        if (r.isSuccess) { ok++; done = true; return@repeat }
+                        Log.d(TAG, "  slot h=${slot.hour} a=$attempt -> ${if (r.isSuccess) "OK" else "FAIL:" + (r.exceptionOrNull()?.message ?: "")}")
+                        if (r.isSuccess) { ok++; written = true; break } // for+break: 每槽只计一次成功
                         Log.w(TAG, "写槽 hour=${slot.hour} 失败(尝试 $attempt): ${r.exceptionOrNull()?.message}")
-                        if (!pumpRepo.ensureConnected()) { delay(300); return@repeat }
-                        delay(200)
+                        delay(250)
                     }
-                    if (!done) fails.add(slot.hour)
+                    if (!written) fails.add(slot.hour)
                     delay(50) // 让步，避免刷爆 GATT 队列 / 与 CGM 推送冲突
                 }
                 // 4) 写完后一次性提交落盘（0x19），NVS 只写一次，彻底消除连续写压力
                 val commit = pumpRepo.commitConfig()
                 val total = slots.value.size
+                Log.d(TAG, "<<< applyAllToPump END ok=$ok total=$total fails=[${fails.joinToString()}] commitOk=${commit.isSuccess} profile=$profile")
                 saveResult.value = buildString {
                     if (ok == total) append("已写入泵内档案(方案 #$profile)全部 $total 段。")
                     else append("部分写入失败：$ok/$total 段成功（失败槽位: ${fails.joinToString()}）。")
