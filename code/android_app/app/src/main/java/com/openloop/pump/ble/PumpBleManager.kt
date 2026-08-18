@@ -134,6 +134,13 @@ class PumpBleManager @Inject constructor(
     private var releaseJob: Job? = null
 
     /**
+     * 前台交互持有：进入设置/电机测试等需主动下发指令的页面时置 true，
+     * 抑制空闲释放（不再 5s 后断开让路 AAPS），保证按钮/开关等交互命令能真正下发到泵。
+     * 离开页面由 releaseConnection() 复位，恢复空闲释放把链路交还 AAPS（AAPS 优先级高于伴生）。
+     */
+    private var foregroundHold = false
+
+    /**
      * 推送完 CGM 后保持连接的时长（ms）。超时即主动断开释放链路，
      * 让 AAPS（闭环主控制方）在下个 5 分钟周期独占泵。AAPS 优先级高于伴生 App。
      * 设 5s：足够覆盖写 CHAR_CGM 的 ACK/notify，又不长期霸占 ACL。
@@ -217,6 +224,10 @@ class PumpBleManager @Inject constructor(
         }
     }
 
+    /** 通过 MAC 地址连接（供伴生 App 主动连接）。 */
+    @SuppressLint("MissingPermission")
+    suspend fun connectSuspend(address: String): Boolean = connect(address)
+
     /** 通过 MAC 地址连接。 */
     @SuppressLint("MissingPermission")
     suspend fun connect(address: String): Boolean = withContext(Dispatchers.IO) {
@@ -276,14 +287,50 @@ class PumpBleManager @Inject constructor(
     /** 调度空闲释放：RELEASE_DELAY_MS 后若仍空闲则主动断开，把链路让给 AAPS。 */
     private fun scheduleIdleRelease() {
         cancelIdleRelease()
+        // 前台交互页面持有连接时（设置/电机测试等）不释放，保证控制命令可达。
+        if (foregroundHold) {
+            Log.d(TAG, "scheduleIdleRelease: 前台持有中，跳过释放")
+            return
+        }
         releaseJob = scope.launch {
             delay(RELEASE_DELAY_MS)
             // 无条件释放：只要本端仍持有 gatt 就断开。若仅靠 `state is Connected` 判断，
             // 服务发现失败等情况下 state 非 Connected 会漏掉释放，把 ACL 永久占住而饿死 AAPS。
-            if (gatt != null) {
+            if (gatt != null && !foregroundHold) {
                 Log.i(TAG, "idle release (yield to AAPS) -> disconnect")
                 disconnect()
             }
+        }
+    }
+
+    /**
+     * 进入需主动下发指令的交互页（设置/电机测试等）时调用：
+     * 抑制空闲释放并立即把链路补连，确保后续控制命令可达。
+     */
+    @SuppressLint("MissingPermission")
+    suspend fun holdConnection() {
+        foregroundHold = true
+        cancelIdleRelease()
+        if (_connectionState.value is ConnectionState.Connected && gatt != null) return
+        val addr = targetAddress ?: run {
+            Log.w(TAG, "holdConnection: 无配对地址")
+            return
+        }
+        Log.i(TAG, "holdConnection: 前台持有，按地址重连 $addr")
+        repeat(4) { i ->
+            if (connect(addr)) return
+            Log.w(TAG, "holdConnection: 重连失败 #$i，重试")
+            delay(500)
+        }
+    }
+
+    /**
+     * 离开交互页时调用：取消前台持有，恢复空闲释放（5s 后让路 AAPS）。
+     */
+    fun releaseConnection() {
+        foregroundHold = false
+        if (_connectionState.value is ConnectionState.Connected && gatt != null) {
+            scheduleIdleRelease()
         }
     }
 
@@ -529,7 +576,7 @@ class PumpBleManager @Inject constructor(
             return false
         }
         Log.i(TAG, "ensureConnected: 链路空闲，按需连接 $addr")
-        repeat(2) { i ->
+        repeat(4) { i ->
             if (connect(addr)) return true
             Log.w(TAG, "ensureConnected: 连接失败 #$i，重试")
             delay(500)

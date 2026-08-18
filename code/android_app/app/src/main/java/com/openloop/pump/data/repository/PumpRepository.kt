@@ -77,6 +77,12 @@ class PumpRepository @Inject constructor(
     /** 批量写前确保 BLE 已连；未连按配对地址重连。返回是否就绪。 */
     suspend fun ensureConnected(): Boolean = ble.ensureConnected()
 
+    /** 进入需主动下发指令的交互页（设置/电机测试等）：抑制空闲释放并补连。 */
+    suspend fun holdConnection() = ble.holdConnection()
+
+    /** 离开交互页：恢复空闲释放（让路 AAPS）。 */
+    fun releaseConnection() = ble.releaseConnection()
+
     /** 写完 24 段后一次性提交配置到 NVS（SET 0x19）。 */
     suspend fun commitConfig(): Result<Unit> = ble.setCommitConfig()
 }
