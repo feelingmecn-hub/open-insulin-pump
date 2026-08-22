@@ -32,6 +32,7 @@ import com.openloop.pump.ui.dashboard.DashboardScreen
 import com.openloop.pump.ui.history.HistoryScreen
 import com.openloop.pump.ui.mirror.PumpMirrorScreen
 import com.openloop.pump.ui.settings.SettingsScreen
+import com.openloop.pump.ui.settings.PermissionsScreen
 import com.openloop.pump.ui.settings.BasalProfileScreen
 import com.openloop.pump.ui.settings.ClosedLoopParamsScreen
 import com.openloop.pump.ui.motortest.MotorTestScreen
@@ -76,6 +77,7 @@ fun AppNavHost(
             }
             composable("cl_params") { ClosedLoopParamsScreen(navController) }
             composable("motor_test") { MotorTestScreen() }
+            composable("permissions") { PermissionsScreen() }
         }
     }
 }

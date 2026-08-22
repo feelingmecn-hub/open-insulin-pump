@@ -36,6 +36,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavController
 import com.openloop.pump.ble.ConnectionState
+import com.openloop.pump.util.PermissionStatus
 import com.openloop.pump.ble.PumpProtocolSpec
 import kotlin.math.roundToInt
 
@@ -115,6 +116,24 @@ fun SettingsScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
+        // ---- 权限缺失告警（顶部红条，点一下直达权限中心）----
+        val permMissing = PermissionStatus.missingRequiredCount(context)
+        if (permMissing > 0) {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        "⚠ $permMissing 项必需权限未授予（蓝牙 / 通知 / 电池优化），闭环可能断连。",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                    Button(
+                        onClick = { nav.navigate("permissions") },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("前往权限中心") }
+                }
+            }
+        }
+
         // ---- 泵连接 ----
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(modifier = Modifier.padding(16.dp)) {
@@ -350,6 +369,18 @@ fun SettingsScreen(
             )
             Button(onClick = { viewModel.setPasskey(passkeyDraft) },
                 modifier = Modifier.fillMaxWidth()) { Text("保存 Passkey") }
+        }
+
+        // ---- 权限中心 ----
+        CardSection("权限中心") {
+            Text(
+                "统一管理蓝牙 / 通知 / 电池优化 / 自启动权限，解决手机里找不到权限入口的问题。",
+                style = MaterialTheme.typography.bodySmall
+            )
+            Button(
+                onClick = { nav.navigate("permissions") },
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("打开权限中心") }
         }
 
         HorizontalDivider()

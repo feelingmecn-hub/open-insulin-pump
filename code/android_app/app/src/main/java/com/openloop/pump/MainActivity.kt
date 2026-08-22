@@ -26,7 +26,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        requestBlePermissions()
+        requestRuntimePermissions()
         startPumpConnectionServiceIfNeeded()
         setContent {
             OpenLoopTheme {
@@ -40,17 +40,23 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** Android 10/11 扫描 BLE 必须授权位置权限；Android 12+ 需 BLUETOOTH_SCAN / BLUETOOTH_CONNECT。 */
-    private fun requestBlePermissions() {
-        val needed = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            listOf(
-                Manifest.permission.BLUETOOTH_SCAN,
-                Manifest.permission.BLUETOOTH_CONNECT
-            )
+    /** 启动即引导所有运行时必需权限（蓝牙 + 通知；Android 11 及以下兼容位置）。
+     *  电池优化/自启动不在启动弹窗（避免骚扰），引导去权限中心手动处理。 */
+    private fun requestRuntimePermissions() {
+        val needed = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            needed += Manifest.permission.BLUETOOTH_SCAN
+            needed += Manifest.permission.BLUETOOTH_CONNECT
         } else {
-            listOf(Manifest.permission.ACCESS_FINE_LOCATION)
-        }.filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
-        if (needed.isNotEmpty()) permLauncher.launch(needed.toTypedArray())
+            needed += Manifest.permission.ACCESS_FINE_LOCATION
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            needed += Manifest.permission.POST_NOTIFICATIONS
+        }
+        val missing = needed.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isNotEmpty()) permLauncher.launch(missing.toTypedArray())
     }
 
     /**
